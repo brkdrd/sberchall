@@ -1,0 +1,15 @@
+# generated artefacts (regenerate by running the notebook)
+data/generated/
+labels_*.npz
+*.pt
+submission.csv
+
+# python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# local
+.DS_Store

@@ -1,0 +1,13 @@
+{
+  "id": "USERNAME/qaoa-angle-baseline",
+  "title": "QAOA angle prediction - baseline",
+  "code_file": "../notebooks/01_baseline_mlp.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "dataset_sources": ["USERNAME/sber-qaoa-data"],
+  "competition_sources": [],
+  "kernel_sources": []
+}
