@@ -1,0 +1,34 @@
+services:
+  train:
+    build: .
+    volumes:
+      - ./runs:/app/runs
+      - ./data:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # fallback for machines without an NVIDIA runtime (slow but functional)
+  train-cpu:
+    build: .
+    volumes:
+      - ./runs:/app/runs
+      - ./data:/app/data
+
+  predict:
+    build: .
+    command: python -m src.predict
+    volumes:
+      - ./runs:/app/runs
+      - ./data:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

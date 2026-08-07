@@ -68,3 +68,63 @@ README – описание данных и инструкции по запус
 Для каждого этапа Конкурса Участник самостоятельно определяет и отмечает итоговое Решение из числа загруженных, которое в дальнейшем будет передано Экспертам для оценки. Оценке подлежит то Решение, которое Участник отметил на Платформе как Лучшее (итоговое).
 
 В рамках индивидуального трека Участник самостоятельно выбирает лучшее Решение на Платформе. В случае выбора итоговым нескольких Решений Участником, Организатор оценивает в рамках Конкурса последнее выбранное итоговое Решение. В случае отсутствия выбора Участником итогового решения Организатор оценивает в рамках Конкурса последнее загруженное Решение Участника.
+
+---
+
+# Solution: learned-optimizer transformer
+
+A decoder-only transformer conditioned on the instance vector `h` via **adaLN-Zero**
+(DiT-style) that acts as a *learned optimiser* over QAOA angles. There are no angle
+labels anywhere — the model is trained by backpropagating **through the differentiable
+QAOA simulator** (`src/qaoa_ref.py`).
+
+## How it works
+
+Each sequence is an optimisation trajectory. A token is a 21-dim vector describing one
+visited point in angle space:
+
+```
+[ 10 angles (5 gamma + 5 beta) | log P(ground) | d log P / d angles (10) ]
+```
+
+- **Step 0**: random angles, evaluated by the simulator.
+- **Each next step**: the transformer reads the whole trajectory so far (causal
+  attention, `h` injected into every block through adaLN-Zero modulation) and outputs a
+  **delta** added to the current angles. The new point is evaluated by the simulator,
+  packed into a token, appended — and the model runs again. 8 steps per rollout.
+- **Loss**: `-log P(ground)` of every predicted point, summed over the rollout with
+  weights increasing toward later steps. The simulator is written in torch, so the
+  gradient flows loss → simulator → predicted angles → transformer. No RL needed:
+  tokens are continuous and the "environment" is differentiable.
+- **Truncated BPTT**: history tokens are detached; gradient reaches each step's
+  prediction only through its own loss. Exploration is Gaussian noise on the predicted
+  angles (reparameterised, decaying over training).
+- **Training data is free**: `h_train` is i.i.d. U(-1,1), so fresh instances are
+  synthesised every iteration; the official `h_train` is held out for evaluation.
+- **Inference**: the landscape is multi-modal, so we run K parallel rollouts from
+  random starts per instance and keep the best point of the best trajectory
+  (best-of-K), optionally polished by a few Adam steps through the simulator.
+
+Code layout: `src/model.py` (transformer), `src/rollout.py` (sim-in-the-loop rollout),
+`src/train.py`, `src/predict.py`, `src/qaoa_ref.py` (differentiable simulator).
+
+## Running with Docker
+
+Requires Docker with the NVIDIA container toolkit for GPU (a CPU fallback is provided).
+
+```bash
+# train (one command; checkpoints + logs land in ./runs)
+docker compose run --rm train
+
+# no GPU available:
+docker compose run --rm train-cpu
+
+# inference -> runs/submission.csv (expects data/raw/h_test.npy and runs/best.pt)
+docker compose run --rm predict
+# or with options:
+docker compose run --rm predict python -m src.predict --h data/raw/h_test.npy --restarts 64 --polish 50
+```
+
+Without Docker: `pip install -r requirements.txt`, then `python -m src.train` and
+`python -m src.predict` from the repo root. All hyperparameters are CLI flags with the
+intended defaults (`python -m src.train --help`).
