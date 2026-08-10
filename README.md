@@ -119,6 +119,12 @@ docker compose run --rm train
 # no GPU available:
 docker compose run --rm train-cpu
 
+# validate a trained model on h_train with the full inference stack
+# (best-of-256 rollouts + 100 Adam polish steps; auto-picks newest runs/**/best.pt)
+docker compose run --rm validate
+# or explicitly:
+docker compose run --rm validate python -m src.validate --ckpt runs/longer/best.pt --restarts 256 --polish 100
+
 # inference -> runs/submission.csv (expects data/raw/h_test.npy and runs/best.pt)
 docker compose run --rm predict
 # or with options:

@@ -32,3 +32,18 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # full inference stack (best-of-K rollouts + Adam polish) scored on h_train
+  validate:
+    build: .
+    command: python -m src.validate
+    volumes:
+      - ./runs:/app/runs
+      - ./data:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
