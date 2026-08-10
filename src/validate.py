@@ -19,7 +19,7 @@ import torch
 
 from .model import AngleTransformer
 from .qaoa_ref import QAOA, P as DEPTH
-from .predict import polish, polish_then_select
+from .predict import polish, polish_then_select, write_submission
 from .rollout import restart_candidates
 
 
@@ -48,6 +48,11 @@ def main():
     ap.add_argument("--restarts", type=int, default=256)
     ap.add_argument("--polish", type=int, default=100)
     ap.add_argument("--top-m", type=int, default=16, help="candidates polished per instance")
+    ap.add_argument(
+        "--out", type=Path, default=Path("runs/submission_train.csv"),
+        help="write the final angles as a submission csv (main-stage leaderboard "
+        "is scored on h_train, so this file is directly submittable)",
+    )
     ap.add_argument("--steps", type=int, default=None, help="default: value stored in ckpt")
     ap.add_argument("--chunk", type=int, default=512)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -90,10 +95,14 @@ def main():
         # polish the top-M candidates per instance, select AFTER polishing
         angles, p = polish_then_select(sim, h, cand_a, cand_p, args.polish, args.top_m)
         report(f"polish top-{args.top_m}, select after", p, time.time() - t0)
+    else:
+        cols = torch.arange(h.shape[0], device=device)
+        angles = cand_a[best_idx, cols]
 
     total = time.time() - t0
     budget = "within" if total < 600 else "OVER"
     print(f"\ntotal inference time: {total:.0f}s — {budget} the 10-minute budget")
+    write_submission(args.out, angles)
 
 
 if __name__ == "__main__":

@@ -95,15 +95,21 @@ def main():
         angles, p = best_of_rollouts(model, sim, h, args.steps, args.restarts, chunk=args.chunk)
         print(f"best-of-{args.restarts} rollouts: mean P(ground) = {p.mean().item():.4f}")
 
-    a = angles.cpu().numpy()
+    write_submission(args.out, angles)
+
+
+def write_submission(path, angles):
+    """Write angles (N, 10) to the competition csv format: id, gamma_0..4, beta_0..4."""
+    a = angles.detach().cpu().numpy()
     header = ["id"] + [f"gamma_{i}" for i in range(DEPTH)] + [f"beta_{i}" for i in range(DEPTH)]
     rows = np.column_stack([np.arange(len(a)), a])
-    args.out.parent.mkdir(parents=True, exist_ok=True)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     np.savetxt(
-        args.out, rows, delimiter=",", header=",".join(header), comments="",
+        path, rows, delimiter=",", header=",".join(header), comments="",
         fmt=["%d"] + ["%.8f"] * 2 * DEPTH,
     )
-    print(f"wrote {args.out}")
+    print(f"wrote {path}")
 
 
 if __name__ == "__main__":
