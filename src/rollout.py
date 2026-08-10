@@ -68,6 +68,28 @@ def rollout(model, sim, h, n_steps, noise_std=0.0, train=True):
     return losses, traj_angles, torch.stack(traj_logp, dim=1)
 
 
+def restart_candidates(model, sim, h, n_steps, n_restarts, chunk=512):
+    """Best trajectory point of every restart, kept separately per restart.
+
+    h: (N, 12). Returns (angles (R, N, 10), p (R, N)) — R candidate points per
+    instance, for polish-then-select at inference.
+    """
+    n = h.shape[0]
+    all_a, all_p = [], []
+    for r in range(n_restarts):
+        pa, aa = [], []
+        for lo in range(0, n, chunk):
+            hi = min(lo + chunk, n)
+            _, ang, lp = rollout(model, sim, h[lo:hi], n_steps, noise_std=0.0, train=False)
+            p = lp.exp()
+            step_best, step_idx = p.max(dim=1)
+            pa.append(step_best)
+            aa.append(ang[torch.arange(hi - lo, device=h.device), step_idx])
+        all_p.append(torch.cat(pa))
+        all_a.append(torch.cat(aa))
+    return torch.stack(all_a), torch.stack(all_p)
+
+
 def best_of_rollouts(model, sim, h, n_steps, n_restarts, chunk=512):
     """Run `n_restarts` independent rollouts per instance, return the best
     angles (over all restarts and all trajectory steps) and their P(ground).

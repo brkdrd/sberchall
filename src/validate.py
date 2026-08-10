@@ -19,8 +19,8 @@ import torch
 
 from .model import AngleTransformer
 from .qaoa_ref import QAOA, P as DEPTH
-from .predict import polish
-from .rollout import best_of_rollouts
+from .predict import polish, polish_then_select
+from .rollout import restart_candidates
 
 
 def find_ckpt(runs_dir=Path("runs")):
@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--data-dir", type=Path, default=Path("data/raw"))
     ap.add_argument("--restarts", type=int, default=256)
     ap.add_argument("--polish", type=int, default=100)
+    ap.add_argument("--top-m", type=int, default=16, help="candidates polished per instance")
     ap.add_argument("--steps", type=int, default=None, help="default: value stored in ckpt")
     ap.add_argument("--chunk", type=int, default=512)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -75,13 +76,20 @@ def main():
     model.eval()
 
     t0 = time.time()
-    angles, p = best_of_rollouts(model, sim, h, steps, args.restarts, chunk=args.chunk)
-    report(f"best-of-{args.restarts} rollouts", p, time.time() - t0)
+    cand_a, cand_p = restart_candidates(model, sim, h, steps, args.restarts, chunk=args.chunk)
+    p0, best_idx = cand_p.max(dim=0)
+    report(f"best-of-{args.restarts} rollouts", p0, time.time() - t0)
 
     if args.polish > 0:
-        angles = polish(sim, h, angles, args.polish)
-        p = sim.p_ground(h, angles[:, :DEPTH], angles[:, DEPTH:])
-        report(f"+ {args.polish} Adam polish steps", p, time.time() - t0)
+        # reference: old flow — polish only the single pre-polish best candidate
+        cols = torch.arange(h.shape[0], device=device)
+        a1 = polish(sim, h, cand_a[best_idx, cols], args.polish)
+        p1 = sim.p_ground(h, a1[:, :DEPTH], a1[:, DEPTH:])
+        report(f"polish best-1 x {args.polish}", p1, time.time() - t0)
+
+        # polish the top-M candidates per instance, select AFTER polishing
+        angles, p = polish_then_select(sim, h, cand_a, cand_p, args.polish, args.top_m)
+        report(f"polish top-{args.top_m}, select after", p, time.time() - t0)
 
     total = time.time() - t0
     budget = "within" if total < 600 else "OVER"
