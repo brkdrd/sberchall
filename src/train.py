@@ -25,8 +25,8 @@ from .rollout import best_of_rollouts, rollout
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data-dir", type=Path, default=Path("data/raw"))
-    ap.add_argument("--out-dir", type=Path, default=Path("runs"))
-    ap.add_argument("--iters", type=int, default=4000)
+    ap.add_argument("--out-dir", type=Path, default=Path("runs/longer"))
+    ap.add_argument("--iters", type=int, default=12000)
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--steps", type=int, default=8, help="rollout length")
     ap.add_argument("--lr", type=float, default=3e-4)
