@@ -108,6 +108,18 @@ visited point in angle space:
 Code layout: `src/model.py` (transformer), `src/rollout.py` (sim-in-the-loop rollout),
 `src/train.py`, `src/predict.py`, `src/qaoa_ref.py` (differentiable simulator).
 
+## Search baselines (notebooks)
+
+No model — pure optimisation over the angles, used as reference scores and as label generators.
+Self-contained and GPU-first, meant for Kaggle/Colab; see `RUNNING.md`.
+
+- `notebooks/02_direct_optimization_baseline.ipynb` — Adam from 32 random restarts per instance.
+- `notebooks/03_massive_multistart.ipynb` — screen ~65k Sobol starting points per instance with a
+  cheap forward-only pass, Adam-refine the survivors through a screen → coarse → fine funnel, and
+  transfer elite angles found on one instance to the rest. Buys far more breadth per unit compute
+  than restarts do, and §4 of the notebook measures that against notebook 02 instead of assuming
+  it.
+
 ## Running with Docker
 
 Requires Docker with the NVIDIA container toolkit for GPU (a CPU fallback is provided).

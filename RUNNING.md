@@ -1,8 +1,16 @@
 # Running the baseline
 
-The deliverable is a single self-contained notebook: `notebooks/01_baseline_mlp.ipynb`.
-It has no repo dependency — no clone, no `pip install` — so `kaggle kernels push` only needs the
-notebook itself. It needs a GPU; on CPU the label-generation step is roughly 80× slower.
+The notebooks are self-contained: no repo dependency — no clone, no `pip install` — so
+`kaggle kernels push` only needs the notebook itself. All of them need a GPU.
+
+| notebook | what it is |
+|---|---|
+| `01_baseline_mlp.ipynb` | supervised MLP on generated angle labels |
+| `02_direct_optimization_baseline.ipynb` | Adam on the angles, 32 random restarts — no model |
+| `03_massive_multistart.ipynb` | screen ~65k Sobol starts per instance, Adam-refine the survivors |
+
+Notebook 03 is the strongest search and the one to run for a reference score; see
+[Massive multistart](#massive-multistart-notebook-03) below.
 
 ## What it needs
 
@@ -63,6 +71,44 @@ paying for generation twice.
 - `submission.csv` — `id, gamma_0..gamma_4, beta_0..beta_4`, one row per input instance
 - `baseline_mlp.pt` — trained weights plus the feature scaler
 - `labels_main.npz` — the generated dataset (`h`, `gamma`, `beta`, `p_ground`, `is_train_pool`)
+
+## Massive multistart (notebook 03)
+
+Same three organiser files, same `find_file()` discovery, same Kaggle push flow — only the
+notebook name changes. It runs a three-stage funnel per instance:
+
+1. **screen** ~65k scrambled-Sobol angle vectors with a forward-only pass (no autograd, so ~3×
+   cheaper than a gradient step) and keep the best 256;
+2. **coarse** 60 Adam steps on those, keep the best 32;
+3. **fine** 400 Adam steps on those, keep the winner.
+
+Every stage keeps the better of (refined point, incoming point), so a stage can never score worse
+than its input.
+
+```python
+CFG = dict(n_sobol=65536, n_ramp=2048, keep_screen=256, steps_coarse=60,
+           keep_coarse=32, steps_fine=400, lr=0.08, lr_fine=0.05,
+           elite_from=64, elite_per=4, screen_rows=16384, adam_rows=2048)
+QUICK = False   # True -> tiny end-to-end smoke run
+```
+
+`n_sobol` is the main quality knob and the dominant cost — scale it to fill the session. The
+config cell prints the work split in gradient-equivalent units before anything runs; expect
+roughly 15–20 min on a T4 at the defaults. `screen_rows`/`adam_rows` bound GPU memory only
+(≈1.6 GiB and ≈4.4 GiB respectively at the defaults); halve on OOM.
+
+Two things it measures rather than assumes:
+
+- **§4** re-runs notebook 02's method (uniform random restarts) at a matched Adam budget and
+  prints the ratio. On a small CPU smoke run the screened funnel scored 0.230 against 0.125 for
+  random restarts — if that ratio ever drops below 1, the screen is not paying for itself and the
+  budget belongs in `steps_fine`.
+- **§7** projects the 500-instance wall clock against the 600 s inference limit. At full breadth
+  it does not fit, which is expected: this is a search, not a model. Use it as a reference score
+  and as a label/candidate generator (`multistart_angles.npz`), or shrink `n_sobol` as §7
+  suggests for a legal safety submission.
+
+Outputs: `submission.csv` and `multistart_angles.npz` (`h`, `gamma`, `beta`, `p_ground`).
 
 ## Reading the results
 
