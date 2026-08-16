@@ -8,9 +8,11 @@ The notebooks are self-contained: no repo dependency — no clone, no `pip insta
 | `01_baseline_mlp.ipynb` | supervised MLP on generated angle labels |
 | `02_direct_optimization_baseline.ipynb` | Adam on the angles, 32 random restarts — no model |
 | `03_massive_multistart.ipynb` | screen ~65k Sobol starts per instance, Adam-refine the survivors |
+| `04_cma_es_restarts.ipynb` | batched IPOP-CMA-ES with restarts, then an Adam polish |
 
-Notebook 03 is the strongest search and the one to run for a reference score; see
-[Massive multistart](#massive-multistart-notebook-03) below.
+Notebooks 03 and 04 are the two strongest searches and the ones to run for a reference score; see
+[Massive multistart](#massive-multistart-notebook-03) and
+[CMA-ES with restarts](#cma-es-with-restarts-notebook-04) below.
 
 ## What it needs
 
@@ -48,7 +50,7 @@ kaggle kernels output USERNAME/qaoa-angle-baseline -p out/     # submission.csv,
 
 `enable_internet` is `false` — nothing is downloaded at runtime.
 
-All three notebooks run in this same environment: same dataset (`J.npy`, `h_train.npy`,
+All four notebooks run in this same environment: same dataset (`J.npy`, `h_train.npy`,
 `QAOA.py`), same GPU kernel, no internet, and nothing beyond numpy/torch/matplotlib. The kaggle
 CLI reads exactly one `kaggle/kernel-metadata.json`, so to push a different notebook edit its two
 identifying fields and push again:
@@ -124,6 +126,55 @@ Two things it measures rather than assumes:
   suggests for a legal safety submission.
 
 Outputs: `submission.csv` and `multistart_angles.npz` (`h`, `gamma`, `beta`, `p_ground`).
+
+## CMA-ES with restarts (notebook 04)
+
+Same three organiser files, same `find_file()` discovery, same Kaggle push flow. It adds no
+imports over notebook 03 — the evolution strategy is written out in the notebook (~120 lines of
+torch), because the Kaggle kernel has `enable_internet: false` and the `cma` package cannot be
+installed.
+
+`runs x 500` independent CMA-ES instances are advanced in lockstep in the same CUDA kernels, so
+covariance algebra costs nothing next to the simulator calls. Restarts happen at two scales: a run
+that trips one of Hansen's termination criteria has its GPU slot reinitialised on the spot
+(a `p_elite` share of those reseeded from angles that won on *other* instances), and each **IPOP
+wave** doubles the population size.
+
+```python
+CFG = dict(cma_evals=90_000, waves=2, runs=8, lam=16, sigma0=0.40,
+           tolfun=1e-11, tolx=1e-11, stag_gens=100, hist_len=20, p_elite=0.25,
+           init=(0.50, 0.25, 0.25), n_screen=4096,
+           keep=16, polish=250, polish_lr=0.05,
+           eval_rows=16384, adam_rows=2048, eig_every=None)
+QUICK = False   # True -> truncates h_train to 24 instances for an end-to-end smoke run
+```
+
+The budget is stated once, in **forward-eval-equivalents per instance** (a gradient step ≈ 3
+forward evals), so it is directly comparable with notebook 03: the defaults spend ~110k against
+notebook 03's ~152k, and §1 prints the split before anything runs. `cma_evals` is the main quality
+knob. `eval_rows`/`adam_rows` bound GPU memory exactly as in notebook 03 (≈1.6 GiB and ≈4.4 GiB);
+halve on OOM. Raise `eig_every` to 3–5 if batched `torch.linalg.eigh` turns out slow on the kernel.
+
+Four things it measures rather than assumes:
+
+- **§3** runs the strategy on sphere, a `1e6`-conditioned ellipsoid, Rosenbrock and Rastrigin
+  before touching QAOA, and asserts on the results. A subtly broken CMA-ES still looks like it is
+  optimising; these four catch it. Rastrigin also demonstrates the population-size effect the IPOP
+  waves are buying (λ=10 stalls at f≈6, λ=200 reaches 0).
+- **§7** is the head-to-head at a matched budget: Adam multistart (nb 02), Sobol funnel (nb 03),
+  CMA-ES alone, CMA-ES + polish, and CMA-ES with eager restarts. CPU probes during development
+  found a **budget crossover** — at ~11.5k evals/instance Adam multistart wins (0.233 vs 0.217),
+  at ~24k CMA-ES wins (0.274 vs 0.242) — and that **tightening the restart triggers costs ~10%**
+  (0.247 vs 0.274), because runs get killed while still improving. Both are 6–8 instances on a
+  CPU and are indicative only; §7 re-measures on the GPU at the budget actually in use.
+- **§8** reports which seeding family produced each instance's winning angles, which restart
+  criterion is ending runs, and what the second wave bought — the three numbers that tell you how
+  to retune `init`, `stag_gens` and `waves`.
+- **§9** projects the 500-instance wall clock against the 600 s inference limit, as notebook 03 does.
+
+Outputs: `submission.csv`, `cma_angles.npz` (`h`, `gamma`, `beta`, `p_ground`), plus
+`cma_history.csv` (one row per generation) and `cma_meta.json` (config, timings, restart
+statistics, score) so runs stay comparable across configs.
 
 ## Reading the results
 

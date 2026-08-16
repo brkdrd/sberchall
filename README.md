@@ -119,6 +119,20 @@ Self-contained and GPU-first, meant for Kaggle/Colab; see `RUNNING.md`.
   transfer elite angles found on one instance to the rest. Buys far more breadth per unit compute
   than restarts do, and §4 of the notebook measures that against notebook 02 instead of assuming
   it.
+- `notebooks/04_cma_es_restarts.ipynb` — **IPOP-CMA-ES with restarts**, batched so that
+  `runs × 500` independent evolution strategies advance in lockstep on the GPU. Where notebook 03
+  buys breadth by sampling, this buys it by *adapting*: each run learns a covariance and a step
+  size, so it explores along the landscape's own geometry rather than along the gradient. Converged
+  runs are detected with Hansen's termination criteria and their GPU slots recycled in place —
+  some reseeded from angles that won on other instances — and each wave doubles the population.
+  §3 validates the implementation on sphere/ellipsoid/Rosenbrock/Rastrigin before it touches QAOA;
+  §7 prices it against notebooks 02 and 03 at a matched evaluation budget.
+
+  The interesting result is that whether a derivative-free method pays off here depends on the
+  budget: below ~11.5k evaluations per instance Adam multistart wins, above ~24k CMA-ES wins.
+  Since the two searches explore differently, their winning angles tend to sit in *different*
+  basins, so the union of `cma_angles.npz` and `multistart_angles.npz` is better supervision — and
+  a tighter oracle — than either alone.
 
 ## Running with Docker
 
