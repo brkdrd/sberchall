@@ -48,6 +48,21 @@ kaggle kernels output USERNAME/qaoa-angle-baseline -p out/     # submission.csv,
 
 `enable_internet` is `false` — nothing is downloaded at runtime.
 
+All three notebooks run in this same environment: same dataset (`J.npy`, `h_train.npy`,
+`QAOA.py`), same GPU kernel, no internet, and nothing beyond numpy/torch/matplotlib. The kaggle
+CLI reads exactly one `kaggle/kernel-metadata.json`, so to push a different notebook edit its two
+identifying fields and push again:
+
+```jsonc
+"id":        "USERNAME/qaoa-massive-multistart",              // must be unique per kernel
+"code_file": "../notebooks/03_massive_multistart.ipynb",
+```
+
+Notebook 03 adds one import over notebook 02 — `torch.quasirandom.SobolEngine`, part of torch
+since 1.0, so no extra dependency. Its GPU peak is about the same: the Adam stage uses the same
+2048-row chunks as notebook 02 (~4 GiB), and the screening stage adds ~1.75 GiB at
+`screen_rows=16384`, both comfortable on a 16 GiB T4 or P100.
+
 ## Cost control
 
 `CFG` in cell 2 is the only knob. Before the expensive run, the notebook times **one full-size
