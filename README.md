@@ -80,11 +80,38 @@ QAOA simulator** (`src/qaoa_ref.py`).
 
 ## How it works
 
+### Angle normalisation (`src/angles.py`)
+
+The two halves of the angle vector are **not** on the same scale, and the pipeline used to
+treat them as one homogeneous 10-vector. The phase separator applies `exp(i*gamma*E)`, and
+for this `J` with `h ~ U(-1,1)` the spectrum spans about **39**, so the phase completes a
+full revolution by `gamma ~ 2*pi/39 ~ 0.16`. The mixer is periodic in `beta` with period
+`pi` regardless of the problem. The two natural scales are therefore ~20x apart.
+
+Ignoring that broke three things at once:
+
+- **search** — sampling `gamma` uniformly on `(-pi, pi)` puts only `(0.16/pi)^5 ~ 3e-7` of
+  the box in the region that carries signal; a 65k-point screen expects 0.02 useful hits;
+- **step size** — one Adam `lr` is 2% of `beta`'s useful range but 19% of `gamma`'s;
+- **model inputs** — `d logP/d gamma` carries a factor of `E ~ +-20` relative to
+  `d logP/d beta`, so the shared `GRAD_CLIP` saturated the gamma gradient features and fed
+  the model a dead input for exactly the coordinates that matter most.
+
+Everything upstream of the simulator now works in normalised units `u`, with
+`angles = u * ANGLE_SCALE`, where the scale is *measured* from the spectrum at startup
+rather than assumed. A unit step means the same thing in both halves, and
+`d logP/du = scale * d logP/d angle` puts the gradient features on a common magnitude by
+construction. The scale travels inside the checkpoint (`angle_scale`); checkpoints saved
+before this change carry none and fall back to the identity, reproducing the old behaviour
+exactly so the two can be compared.
+
+### The trajectory
+
 Each sequence is an optimisation trajectory. A token is a 21-dim vector describing one
-visited point in angle space:
+visited point in **normalised** angle space:
 
 ```
-[ 10 angles (5 gamma + 5 beta) | log P(ground) | d log P / d angles (10) ]
+[ 10 units (5 gamma + 5 beta) | log P(ground) | d log P / d units (10) ]
 ```
 
 - **Step 0**: random angles, evaluated by the simulator.
@@ -105,8 +132,9 @@ visited point in angle space:
   random starts per instance and keep the best point of the best trajectory
   (best-of-K), optionally polished by a few Adam steps through the simulator.
 
-Code layout: `src/model.py` (transformer), `src/rollout.py` (sim-in-the-loop rollout),
-`src/train.py`, `src/predict.py`, `src/qaoa_ref.py` (differentiable simulator).
+Code layout: `src/model.py` (transformer), `src/angles.py` (angle normalisation),
+`src/rollout.py` (sim-in-the-loop rollout), `src/train.py`, `src/predict.py`,
+`src/qaoa_ref.py` (differentiable simulator — the organisers' file, unmodified).
 
 ## Search baselines (notebooks)
 

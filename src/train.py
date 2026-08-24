@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .angles import angle_scale, energy_span
 from .model import AngleTransformer, COND_DIM
 from .qaoa_ref import QAOA
 from .rollout import best_of_rollouts, rollout
@@ -43,10 +44,10 @@ def parse_args():
     return ap.parse_args()
 
 
-def evaluate(model, sim, h_eval, args):
+def evaluate(model, sim, h_eval, scale, args):
     model.eval()
     _, p = best_of_rollouts(
-        model, sim, h_eval, args.steps, args.eval_restarts, chunk=args.eval_chunk
+        model, sim, h_eval, args.steps, args.eval_restarts, scale, chunk=args.eval_chunk
     )
     model.train()
     return p.mean().item()
@@ -64,6 +65,17 @@ def main():
         np.load(args.data_dir / "h_train.npy"), dtype=torch.float32, device=device
     )
     sim = QAOA(J, device=device)
+
+    # Angle normalisation, measured from the actual spectrum rather than assumed.
+    # gamma and beta differ in natural scale by ~20x; see angles.py.
+    scale = angle_scale(sim, h_eval, device=device)
+    print(
+        f"energy span {energy_span(sim, h_eval):.2f}  ->  "
+        f"gamma unit {scale[0].item():.4f} rad, beta unit {scale[-1].item():.4f} rad "
+        f"({scale[-1].item() / scale[0].item():.1f}x apart)",
+        flush=True,
+    )
+
     model = AngleTransformer(
         d=args.d_model, n_heads=args.heads, n_layers=args.layers, max_len=args.steps + 1
     ).to(device)
@@ -86,7 +98,7 @@ def main():
         )
         h = (torch.rand(args.batch, COND_DIM, device=device) * 2 - 1)
 
-        losses, _, traj_logp = rollout(model, sim, h, args.steps, noise_std=noise)
+        losses, _, traj_logp = rollout(model, sim, h, args.steps, scale, noise_std=noise)
         loss = sum(wt * l.mean() for wt, l in zip(w, losses))
 
         opt.zero_grad(set_to_none=True)
@@ -106,13 +118,16 @@ def main():
             )
 
         if it % args.eval_every == 0 or it == args.iters:
-            metric = evaluate(model, sim, h_eval, args)
+            metric = evaluate(model, sim, h_eval, scale, args)
             print(
                 f"eval  iter {it}: mean best-of-{args.eval_restarts} "
                 f"P(ground) on h_train = {metric:.4f}",
                 flush=True,
             )
-            ckpt = {"model": model.state_dict(), "config": cfg, "metric": metric, "iter": it}
+            # angle_scale must travel with the weights: the model emits normalised units,
+            # so inference cannot convert them back to radians without it.
+            ckpt = {"model": model.state_dict(), "config": cfg, "metric": metric,
+                    "iter": it, "angle_scale": scale.cpu()}
             torch.save(ckpt, args.out_dir / "last.pt")
             if metric > best_metric:
                 best_metric = metric

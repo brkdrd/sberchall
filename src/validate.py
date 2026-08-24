@@ -17,9 +17,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .angles import to_angles
 from .model import AngleTransformer
 from .qaoa_ref import QAOA, P as DEPTH
-from .predict import polish, polish_then_select, write_submission
+from .predict import load_scale, polish, polish_then_select, write_submission
 from .rollout import restart_candidates
 
 
@@ -79,30 +80,34 @@ def main():
     ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
+    scale = load_scale(ckpt, device)
 
     t0 = time.time()
-    cand_a, cand_p = restart_candidates(model, sim, h, steps, args.restarts, chunk=args.chunk)
+    cand_u, cand_p = restart_candidates(
+        model, sim, h, steps, args.restarts, scale, chunk=args.chunk
+    )
     p0, best_idx = cand_p.max(dim=0)
     report(f"best-of-{args.restarts} rollouts", p0, time.time() - t0)
 
     if args.polish > 0:
         # reference: old flow — polish only the single pre-polish best candidate
         cols = torch.arange(h.shape[0], device=device)
-        a1 = polish(sim, h, cand_a[best_idx, cols], args.polish)
+        u1 = polish(sim, h, cand_u[best_idx, cols], scale, args.polish)
+        a1 = to_angles(u1, scale)
         p1 = sim.p_ground(h, a1[:, :DEPTH], a1[:, DEPTH:])
         report(f"polish best-1 x {args.polish}", p1, time.time() - t0)
 
         # polish the top-M candidates per instance, select AFTER polishing
-        angles, p = polish_then_select(sim, h, cand_a, cand_p, args.polish, args.top_m)
+        u, p = polish_then_select(sim, h, cand_u, cand_p, scale, args.polish, args.top_m)
         report(f"polish top-{args.top_m}, select after", p, time.time() - t0)
     else:
         cols = torch.arange(h.shape[0], device=device)
-        angles = cand_a[best_idx, cols]
+        u = cand_u[best_idx, cols]
 
     total = time.time() - t0
     budget = "within" if total < 600 else "OVER"
     print(f"\ntotal inference time: {total:.0f}s — {budget} the 10-minute budget")
-    write_submission(args.out, angles)
+    write_submission(args.out, to_angles(u, scale))     # csv is always in radians
 
 
 if __name__ == "__main__":
