@@ -190,7 +190,18 @@ out of sync. That means it needs settings the others do not:
 |---|---|---|
 | Accelerator | GPU | training is not CPU-feasible |
 | Internet | **On** | it clones from GitHub |
-| Secret `GITHUB_TOKEN` | fine-grained PAT, Contents: Read | the repo is private |
+| Secret `GITHUB_TOKEN` **or** `SSH_KEY` | see below | the repo is private |
+
+A Kaggle container has no SSH key and no git credentials, so whatever you use to clone
+locally does not carry over — it needs its own. Attach **either** secret:
+
+| secret | value | notes |
+|---|---|---|
+| `GITHUB_TOKEN` | fine-grained PAT, **Contents: Read** | recommended: read-only, single repo, revocable without touching your key |
+| `SSH_KEY` | an SSH **private** key authorised on the repo | use a deploy key rather than your personal one; base64-encode it (`base64 -w0`) if Kaggle mangles the newlines |
+
+`SSH_KEY` takes precedence if both are attached; with neither, the clone falls back to
+anonymous and only works if the repo is public.
 
 `J.npy` and `h_train.npy` are tracked in git, so no Kaggle dataset needs attaching. Push it
 with its own metadata file:
