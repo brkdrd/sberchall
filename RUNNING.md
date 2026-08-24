@@ -1,7 +1,9 @@
 # Running the baseline
 
-The notebooks are self-contained: no repo dependency — no clone, no `pip install` — so
-`kaggle kernels push` only needs the notebook itself. All of them need a GPU.
+Notebooks 01-04 are self-contained: no repo dependency — no clone, no `pip install` — so
+`kaggle kernels push` only needs the notebook itself. Notebook 05 is deliberately the
+opposite: it clones this repo and runs `src/`, so it needs internet and a token. All of them
+need a GPU.
 
 | notebook | what it is |
 |---|---|
@@ -9,6 +11,7 @@ The notebooks are self-contained: no repo dependency — no clone, no `pip insta
 | `02_direct_optimization_baseline.ipynb` | Adam on the angles, 32 random restarts — no model |
 | `03_massive_multistart.ipynb` | screen ~65k Sobol starts per instance, Adam-refine the survivors |
 | `04_cma_es_restarts.ipynb` | batched IPOP-CMA-ES with restarts, then an Adam polish |
+| `05_train_pipeline_kaggle.ipynb` | clones the repo and runs the `src/` train + validate pipeline on a Kaggle GPU |
 
 Notebooks 03 and 04 are the two strongest searches and the ones to run for a reference score; see
 [Massive multistart](#massive-multistart-notebook-03) and
@@ -50,7 +53,8 @@ kaggle kernels output USERNAME/qaoa-angle-baseline -p out/     # submission.csv,
 
 `enable_internet` is `false` — nothing is downloaded at runtime.
 
-All four notebooks run in this same environment: same dataset (`J.npy`, `h_train.npy`,
+Notebook 05 is the odd one out — see [Training on Kaggle](#training-on-kaggle-notebook-05).
+The other four run in this same environment: same dataset (`J.npy`, `h_train.npy`,
 `QAOA.py`), same GPU kernel, no internet, and nothing beyond numpy/torch/matplotlib. The kaggle
 CLI reads exactly one `kaggle/kernel-metadata.json`, so to push a different notebook edit its two
 identifying fields and push again:
@@ -175,6 +179,38 @@ Four things it measures rather than assumes:
 Outputs: `submission.csv`, `cma_angles.npz` (`h`, `gamma`, `beta`, `p_ground`), plus
 `cma_history.csv` (one row per generation) and `cma_meta.json` (config, timings, restart
 statistics, score) so runs stay comparable across configs.
+
+## Training on Kaggle (notebook 05)
+
+Notebooks 01-04 are self-contained by design. Notebook 05 is the opposite: it **clones this
+repo and runs `src/`**, so the code under test is the pipeline itself, with no copy to drift
+out of sync. That means it needs settings the others do not:
+
+| setting | value | why |
+|---|---|---|
+| Accelerator | GPU | training is not CPU-feasible |
+| Internet | **On** | it clones from GitHub |
+| Secret `GITHUB_TOKEN` | fine-grained PAT, Contents: Read | the repo is private |
+
+`J.npy` and `h_train.npy` are tracked in git, so no Kaggle dataset needs attaching. Push it
+with its own metadata file:
+
+```bash
+cp kaggle/kernel-metadata-train.json kaggle/kernel-metadata.json   # or edit id/code_file
+kaggle kernels push -p kaggle
+```
+
+`TRAIN_HOURS` is the real knob, not `ITERS`. `src/train.py` writes `best.pt` at every
+`--eval-every`, so the notebook enforces the budget by terminating training and validating
+whatever checkpoint exists — set `ITERS` optimistically and let the clock decide. `QUICK =
+True` runs the whole clone -> train -> validate path in about five minutes.
+
+**§4 prints the measured angle scale before training starts.** Expect a span near 39, a gamma
+unit near 0.16 rad, a beta unit of pi/2, and a ratio near 10x. If those look wrong, stop there
+rather than spending GPU hours — that scale is what the run is testing (see
+[Angle normalisation](README.md#angle-normalisation-srcanglespy)).
+
+Outputs land in `/kaggle/working`: `submission_train.csv`, `best.pt`, `config.json`.
 
 ## Reading the results
 

@@ -1,0 +1,13 @@
+{
+  "id": "USERNAME/qaoa-train-pipeline",
+  "title": "QAOA train pipeline (clone + train + validate)",
+  "code_file": "../notebooks/05_train_pipeline_kaggle.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}
