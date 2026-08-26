@@ -23,11 +23,14 @@ from .qaoa_ref import QAOA
 from .rollout import best_of_rollouts, rollout
 
 
-def parse_args():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data-dir", type=Path, default=Path("data/raw"))
     ap.add_argument("--out-dir", type=Path, default=Path("runs/longer"))
     ap.add_argument("--iters", type=int, default=12000)
+    ap.add_argument("--max-hours", type=float, default=0.0,
+                    help="wall-clock budget; 0 = unlimited. On expiry the loop evaluates, "
+                         "checkpoints and stops, so the run is always safe to cut short.")
     ap.add_argument("--batch", type=int, default=128)
     ap.add_argument("--steps", type=int, default=8, help="rollout length")
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -41,7 +44,7 @@ def parse_args():
     ap.add_argument("--eval-chunk", type=int, default=512)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    return ap.parse_args()
+    return ap.parse_args(argv)
 
 
 def evaluate(model, sim, h_eval, scale, args):
@@ -53,8 +56,8 @@ def evaluate(model, sim, h_eval, scale, args):
     return p.mean().item()
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -90,7 +93,32 @@ def main():
     (args.out_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
     best_metric = 0.0
+    best_iter = 0
+
+    def checkpoint(it):
+        """Evaluate, write last.pt, and promote to best.pt if this is a new best."""
+        nonlocal best_metric, best_iter
+        metric = evaluate(model, sim, h_eval, scale, args)
+        print(
+            f"eval  iter {it}: mean best-of-{args.eval_restarts} "
+            f"P(ground) on h_train = {metric:.4f}",
+            flush=True,
+        )
+        # angle_scale must travel with the weights: the model emits normalised units,
+        # so inference cannot convert them back to radians without it.
+        ckpt = {"model": model.state_dict(), "config": cfg, "metric": metric,
+                "iter": it, "angle_scale": scale.cpu()}
+        torch.save(ckpt, args.out_dir / "last.pt")
+        if metric > best_metric:
+            best_metric, best_iter = metric, it
+            torch.save(ckpt, args.out_dir / "best.pt")
+            print(f"      new best -> {args.out_dir / 'best.pt'}", flush=True)
+        return metric
+
+    budget_s = args.max_hours * 3600 if args.max_hours else None
+    stopped_early = False
     t0 = time.time()
+    it = 0
     for it in range(1, args.iters + 1):
         frac = (it - 1) / max(args.iters - 1, 1)
         noise = args.noise_final + 0.5 * (args.noise - args.noise_final) * (
@@ -117,24 +145,27 @@ def main():
                 flush=True,
             )
 
-        if it % args.eval_every == 0 or it == args.iters:
-            metric = evaluate(model, sim, h_eval, scale, args)
+        evaluated = it % args.eval_every == 0 or it == args.iters
+        if evaluated:
+            checkpoint(it)
+
+        if budget_s and time.time() - t0 > budget_s:
             print(
-                f"eval  iter {it}: mean best-of-{args.eval_restarts} "
-                f"P(ground) on h_train = {metric:.4f}",
+                f"\nwall-clock budget of {args.max_hours:g} h reached at iter {it} "
+                f"-- evaluating once more, then stopping",
                 flush=True,
             )
-            # angle_scale must travel with the weights: the model emits normalised units,
-            # so inference cannot convert them back to radians without it.
-            ckpt = {"model": model.state_dict(), "config": cfg, "metric": metric,
-                    "iter": it, "angle_scale": scale.cpu()}
-            torch.save(ckpt, args.out_dir / "last.pt")
-            if metric > best_metric:
-                best_metric = metric
-                torch.save(ckpt, args.out_dir / "best.pt")
-                print(f"      new best -> {args.out_dir / 'best.pt'}", flush=True)
+            if not evaluated:
+                checkpoint(it)
+            stopped_early = True
+            break
 
-    print(f"done. best eval metric: {best_metric:.4f}")
+    elapsed = time.time() - t0
+    print(f"done. {it} iters in {elapsed / 60:.1f} min. "
+          f"best eval metric: {best_metric:.4f} (iter {best_iter})")
+    return {"best_ckpt": args.out_dir / "best.pt", "best_metric": best_metric,
+            "best_iter": best_iter, "iters_run": it, "seconds": elapsed,
+            "stopped_early": stopped_early}
 
 
 if __name__ == "__main__":

@@ -2,8 +2,8 @@
 
 Notebooks 01-04 are self-contained: no repo dependency — no clone, no `pip install` — so
 `kaggle kernels push` only needs the notebook itself. Notebook 05 is deliberately the
-opposite: it clones this repo and runs `src/`, so it needs internet and a token. All of them
-need a GPU.
+opposite: it holds no experiment at all, only a clone and a `python -m src`, so it needs
+internet. All of them need a GPU.
 
 | notebook | what it is |
 |---|---|
@@ -11,7 +11,7 @@ need a GPU.
 | `02_direct_optimization_baseline.ipynb` | Adam on the angles, 32 random restarts — no model |
 | `03_massive_multistart.ipynb` | screen ~65k Sobol starts per instance, Adam-refine the survivors |
 | `04_cma_es_restarts.ipynb` | batched IPOP-CMA-ES with restarts, then an Adam polish |
-| `05_train_pipeline_kaggle.ipynb` | clones the repo and runs the `src/` train + validate pipeline on a Kaggle GPU |
+| `05_kaggle_runner.ipynb` | a stub: clones the repo and runs `python -m src` on a Kaggle GPU |
 
 Notebooks 03 and 04 are the two strongest searches and the ones to run for a reference score; see
 [Massive multistart](#massive-multistart-notebook-03) and
@@ -53,7 +53,7 @@ kaggle kernels output USERNAME/qaoa-angle-baseline -p out/     # submission.csv,
 
 `enable_internet` is `false` — nothing is downloaded at runtime.
 
-Notebook 05 is the odd one out — see [Training on Kaggle](#training-on-kaggle-notebook-05).
+Notebook 05 is the odd one out — see [The Kaggle runner](#the-kaggle-runner-notebook-05).
 The other four run in this same environment: same dataset (`J.npy`, `h_train.npy`,
 `QAOA.py`), same GPU kernel, no internet, and nothing beyond numpy/torch/matplotlib. The kaggle
 CLI reads exactly one `kaggle/kernel-metadata.json`, so to push a different notebook edit its two
@@ -180,11 +180,19 @@ Outputs: `submission.csv`, `cma_angles.npz` (`h`, `gamma`, `beta`, `p_ground`), 
 `cma_history.csv` (one row per generation) and `cma_meta.json` (config, timings, restart
 statistics, score) so runs stay comparable across configs.
 
-## Training on Kaggle (notebook 05)
+## The Kaggle runner (notebook 05)
 
-Notebooks 01-04 are self-contained by design. Notebook 05 is the opposite: it **clones this
-repo and runs `src/`**, so the code under test is the pipeline itself, with no copy to drift
-out of sync. That means it needs settings the others do not:
+Notebooks 01-04 are self-contained by design. Notebook 05 is the opposite, and deliberately
+contains **nothing but a launcher**: it clones this repo into `/tmp/sberchall` and runs
+
+```
+python -m src
+```
+
+Two cells, no configuration, no analysis. Everything a run does lives in the repo, so the
+workflow is: edit `src/`, commit to `main`, press **Run all** on the same notebook, read the
+log. The notebook itself should not need to change between experiments — if you find yourself
+editing it, that logic belongs in `src/experiment.py` instead.
 
 | setting | value | why |
 |---|---|---|
@@ -192,27 +200,60 @@ out of sync. That means it needs settings the others do not:
 | Internet | **On** | it clones from GitHub |
 
 The repo is public, so the clone is anonymous: no Kaggle secret, no SSH key, no token.
-Internet still has to be on — the clone is a network call.
-
-`J.npy` and `h_train.npy` are tracked in git, so no Kaggle dataset needs attaching. Push it
-with its own metadata file:
+Internet still has to be on — the clone is a network call. `J.npy` and `h_train.npy` are
+tracked in git, so no Kaggle dataset needs attaching. Push it with its own metadata file:
 
 ```bash
 cp kaggle/kernel-metadata-train.json kaggle/kernel-metadata.json   # or edit id/code_file
 kaggle kernels push -p kaggle
 ```
 
-`TRAIN_HOURS` is the real knob, not `ITERS`. `src/train.py` writes `best.pt` at every
-`--eval-every`, so the notebook enforces the budget by terminating training and validating
-whatever checkpoint exists — set `ITERS` optimistically and let the clock decide. `QUICK =
-True` runs the whole clone -> train -> validate path in about five minutes.
+`BRANCH` in the cell is the one thing worth touching: point it at a feature branch to try an
+experiment before merging it.
 
-**§4 prints the measured angle scale before training starts.** Expect a span near 39, a gamma
-unit near 0.16 rad, a beta unit of pi/2, and a ratio near 10x. If those look wrong, stop there
-rather than spending GPU hours — that scale is what the run is testing (see
-[Angle normalisation](README.md#angle-normalisation-srcanglespy)).
+### Configuring a run: `src/experiment.py`
 
-Outputs land in `/kaggle/working`: `submission_train.csv`, `best.pt`, `config.json`.
+The `CONFIG` dict at the top of `src/experiment.py` is the knob the notebook used to hold:
+
+```python
+CONFIG = {
+    "name": "norm",
+    "train_hours": 6.0,     # wall-clock budget; the real control, not `iters`
+    "iters": 12000,         # upper bound — the clock usually binds first
+    "batch": 128, "steps": 8, "lr": 3e-4,
+    "eval_every": 500, "eval_restarts": 16, "seed": 0,
+    "val_restarts": 256, "val_polish": 100, "val_top_m": 16,
+}
+```
+
+`train_hours` is the real knob, not `iters`: `src/train.py` checkpoints at every
+`--eval-every`, and on hitting the budget it evaluates once more, saves, and stops cleanly —
+so set `iters` optimistically and let the clock decide. Locally you can shortcut the dict
+without a commit:
+
+```bash
+python -m src --quick                                  # ~5 min end-to-end smoke test
+python -m src --set train_hours=1 --set val_restarts=64
+```
+
+The notebook passes no arguments, by design.
+
+`main()` runs four stages, each printing under its own banner:
+
+- **preflight** — device, data, and the measured angle scale. Expect a span near 39, a gamma
+  unit near 0.16 rad, a beta unit of pi/2, and a ratio near 10x; if those look wrong, stop
+  there rather than spending GPU hours (see
+  [Angle normalisation](README.md#angle-normalisation-srcanglespy)).
+- **train** — `src.train` under the wall-clock budget.
+- **validate** — `src.validate`, the full best-of-K + polish stack, timed against the 600 s
+  inference limit.
+- **summary** — re-scores the submission that was actually written and prints it against the
+  reference numbers in `REFERENCE`.
+
+Artefacts are written straight to `/kaggle/working` (so they appear in the output pane):
+`best.pt`, `last.pt`, `config.json`, `submission_train.csv`, and `summary.json` — the last
+being a machine-readable record of commit, config, timings and scores, so runs stay
+comparable.
 
 ## Reading the results
 

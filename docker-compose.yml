@@ -19,6 +19,22 @@ services:
       - ./runs:/app/runs
       - ./data:/app/data
 
+  # the same entry point Kaggle runs: preflight -> train -> validate -> summary,
+  # configured by CONFIG in src/experiment.py
+  experiment:
+    build: .
+    command: python -m src
+    volumes:
+      - ./runs:/app/runs
+      - ./data:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   predict:
     build: .
     command: python -m src.predict

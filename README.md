@@ -132,9 +132,11 @@ visited point in **normalised** angle space:
   random starts per instance and keep the best point of the best trajectory
   (best-of-K), optionally polished by a few Adam steps through the simulator.
 
-Code layout: `src/model.py` (transformer), `src/angles.py` (angle normalisation),
-`src/rollout.py` (sim-in-the-loop rollout), `src/train.py`, `src/predict.py`,
-`src/qaoa_ref.py` (differentiable simulator — the organisers' file, unmodified).
+Code layout: `src/experiment.py` (**entry point** — `python -m src` runs preflight → train →
+validate → summary, and its `CONFIG` dict is the run's configuration), `src/model.py`
+(transformer), `src/angles.py` (angle normalisation), `src/rollout.py` (sim-in-the-loop
+rollout), `src/train.py`, `src/validate.py`, `src/predict.py`, `src/qaoa_ref.py`
+(differentiable simulator — the organisers' file, unmodified).
 
 ## Search baselines (notebooks)
 
@@ -167,7 +169,10 @@ Self-contained and GPU-first, meant for Kaggle/Colab; see `RUNNING.md`.
 Requires Docker with the NVIDIA container toolkit for GPU (a CPU fallback is provided).
 
 ```bash
-# train (one command; checkpoints + logs land in ./runs)
+# the whole experiment, exactly as Kaggle runs it: preflight -> train -> validate -> summary
+docker compose run --rm experiment
+
+# train only (checkpoints + logs land in ./runs)
 docker compose run --rm train
 
 # no GPU available:
@@ -185,6 +190,14 @@ docker compose run --rm predict
 docker compose run --rm predict python -m src.predict --h data/raw/h_test.npy --restarts 64 --polish 50
 ```
 
-Without Docker: `pip install -r requirements.txt`, then `python -m src.train` and
-`python -m src.predict` from the repo root. All hyperparameters are CLI flags with the
-intended defaults (`python -m src.train --help`).
+Without Docker: `pip install -r requirements.txt`, then from the repo root
+
+```bash
+python -m src                 # the whole configured experiment (what Kaggle runs)
+python -m src --quick         # same path, ~5 minutes, for checking a change works
+```
+
+or drive the stages individually — `python -m src.train`, `python -m src.validate`,
+`python -m src.predict`. All hyperparameters are CLI flags with the intended defaults
+(`python -m src.train --help`); `src/experiment.py`'s `CONFIG` is what fills them in for a
+full run, so that dict is the thing to edit for a new experiment.

@@ -41,7 +41,7 @@ def report(tag, p, t):
     )
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ckpt", type=Path, default=None, help="default: newest runs/**/best.pt")
     ap.add_argument("--h", type=Path, default=Path("data/raw/h_train.npy"))
@@ -57,7 +57,7 @@ def main():
     ap.add_argument("--steps", type=int, default=None, help="default: value stored in ckpt")
     ap.add_argument("--chunk", type=int, default=512)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     device = args.device
     ckpt_path = args.ckpt or find_ckpt()
@@ -102,12 +102,15 @@ def main():
         report(f"polish top-{args.top_m}, select after", p, time.time() - t0)
     else:
         cols = torch.arange(h.shape[0], device=device)
-        u = cand_u[best_idx, cols]
+        u, p = cand_u[best_idx, cols], p0
 
     total = time.time() - t0
     budget = "within" if total < 600 else "OVER"
     print(f"\ntotal inference time: {total:.0f}s — {budget} the 10-minute budget")
     write_submission(args.out, to_angles(u, scale))     # csv is always in radians
+    return {"submission": args.out, "mean_p": p.mean().item(),
+            "median_p": p.median().item(), "min_p": p.min().item(),
+            "seconds": total, "within_budget": total < 600}
 
 
 if __name__ == "__main__":
