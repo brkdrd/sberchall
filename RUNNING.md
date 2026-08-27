@@ -204,9 +204,14 @@ Internet still has to be on — the clone is a network call. `J.npy` and `h_trai
 tracked in git, so no Kaggle dataset needs attaching. Push it with its own metadata file:
 
 ```bash
-cp kaggle/kernel-metadata-train.json kaggle/kernel-metadata.json   # or edit id/code_file
-kaggle kernels push -p kaggle
+./kaggle/push.sh          # fills your handle in from ~/.kaggle/kaggle.json and pushes
 ```
+
+Do **not** push `kernel-metadata-train.json` with its `USERNAME` placeholder still in the
+`id` — Kaggle tries to resolve a user literally named `USERNAME` and fails with
+`Permission 'users.get' was denied`. `push.sh` exists to make that unmissable. Pushing from
+the CLI is optional anyway: the notebook is two cells, so pasting them into a new notebook in
+the Kaggle web UI works just as well and skips metadata entirely.
 
 `BRANCH` in the cell is the one thing worth touching: point it at a feature branch to try an
 experiment before merging it.
