@@ -194,10 +194,15 @@ workflow is: edit `src/`, commit to `main`, press **Run all** on the same notebo
 log. The notebook itself should not need to change between experiments — if you find yourself
 editing it, that logic belongs in `src/experiment.py` instead.
 
-| setting | value | why |
+| host | settings | notes |
 |---|---|---|
-| Accelerator | GPU | training is not CPU-feasible |
-| Internet | **On** | it clones from GitHub |
+| Kaggle | Accelerator: GPU; Internet: **On** | both required — the clone is a network call |
+| Colab | Runtime -> Change runtime type -> GPU | internet is on by default |
+
+The same two cells run on both. Outputs go to `/kaggle/working` on Kaggle and `/content/<name>`
+on Colab; `src/experiment.py`'s `output_dir()` picks. Colab matters beyond convenience — the
+competition requires the solution to run there start to finish (`README.md`), and free-tier
+Colab gives far less GPU time than Kaggle's 9 h, so `basin_hours` needs cutting there.
 
 The repo is public, so the clone is anonymous: no Kaggle secret, no SSH key, no token.
 Internet still has to be on — the clone is a network call. `J.npy` and `h_train.npy` are

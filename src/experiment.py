@@ -116,11 +116,17 @@ def git_sha():
 
 
 def output_dir(cfg):
-    """Where artefacts go. On Kaggle that must be /kaggle/working to be saved as output."""
-    kaggle = Path("/kaggle/working")
-    if kaggle.is_dir():
-        return kaggle
-    d = REPO / "runs" / cfg["name"]
+    """Where artefacts go, per host.
+
+    Kaggle: /kaggle/working is the only directory saved as notebook output.
+    Colab:  /content is the runtime's working directory and what the file browser opens
+            on. The clone lives in /tmp, which is invisible there and dies with the
+            runtime, so writing results next to the code would silently lose them.
+    """
+    if Path("/kaggle/working").is_dir():
+        return Path("/kaggle/working")
+    base = Path("/content") if Path("/content").is_dir() else REPO / "runs"
+    d = base / cfg["name"]
     d.mkdir(parents=True, exist_ok=True)
     return d
 
