@@ -132,11 +132,37 @@ visited point in **normalised** angle space:
   random starts per instance and keep the best point of the best trajectory
   (best-of-K), optionally polished by a few Adam steps through the simulator.
 
-Code layout: `src/experiment.py` (**entry point** — `python -m src` runs preflight → train →
-validate → summary, and its `CONFIG` dict is the run's configuration), `src/model.py`
-(transformer), `src/angles.py` (angle normalisation), `src/rollout.py` (sim-in-the-loop
-rollout), `src/train.py`, `src/validate.py`, `src/predict.py`, `src/qaoa_ref.py`
-(differentiable simulator — the organisers' file, unmodified).
+Code layout: `src/experiment.py` (**entry point** — `python -m src`, and its `CONFIG` dict is
+the run's configuration), `src/model.py` (transformer), `src/angles.py` (angle normalisation
+and the symmetry canonicaliser), `src/rollout.py` (sim-in-the-loop rollout), `src/train.py`,
+`src/validate.py`, `src/predict.py`, `src/basins.py` + `src/proposer.py` (learned restarts,
+below), `src/qaoa_ref.py` (differentiable simulator — the organisers' file, unmodified).
+
+## Learned restarts (`src/basins.py`, `src/proposer.py`)
+
+A second mode, and the one `CONFIG["mode"]` selects by default. The premise is that Adam
+through the simulator is already the best angle-finder available — its only real failure is
+converging into a bad basin — so the model's job is to say *where to start it*, not to
+replace it.
+
+- `src/basins.py` runs Adam forwards from many random starts per instance and keeps the
+  starts that reached that instance's best-known optimum. Those are labelled points inside
+  the good basin. (Running the flow *backwards* from a known optimum does not work: reverse
+  time is expanding, so integration error blows up, and Adam is not a reversible map.)
+- `src/proposer.py` trains `h -> K starts` against those labels with a Chamfer loss —
+  each prediction is pulled to its *nearest* label, and each label pulls its nearest
+  prediction. The minimum is what matters: for a fixed `h` the good starts form several
+  disjoint blobs, and an ordinary L2 regression would fit their mean, which lies in no
+  basin at all.
+- Inference is unchanged otherwise: propose K starts, Adam from each, select after
+  polishing. The run reports the same budget spent on *random* starts alongside, because
+  that is the only comparison that says whether the model contributed anything.
+
+Both stages lean on `angles.canonicalise`. `P(ground)` is exactly invariant under a
+64-element group (`beta_i += pi` per layer, and the global sign flip `(gamma, beta) ->
+(-gamma, -beta)`), so every optimum has 63 duplicates. Folding into the fundamental domain
+is what makes "did these two starts reach the same optimum?" well-posed, and it shrinks the
+region the proposer has to cover by 64x.
 
 ## Search baselines (notebooks)
 

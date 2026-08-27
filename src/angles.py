@@ -62,6 +62,32 @@ def legacy_scale(device=None):
     return torch.ones(N_ANGLES, dtype=torch.float32, device=device)
 
 
+def canonicalise(u):
+    """Fold normalised angles into the fundamental domain of P(ground)'s symmetry group.
+
+    P(ground) is *exactly* invariant under a 64-element group acting on the angles:
+
+    - `beta_i += pi` independently per layer (the mixer flips every qubit's sign, and
+      `(-1)^12 = +1`), which in normalised units is `u_beta += 2`  -> 2^5 = 32 elements;
+    - the global sign flip `(gamma, beta) -> (-gamma, -beta)`, which conjugates a state
+      built from a real spectrum and so leaves every amplitude's modulus alone -> x2.
+
+    So every optimum comes with 63 exact duplicates. Averaging over them — which is what
+    an MSE regression to a set of search-generated labels does — lands on their mean,
+    and the mean over a `+-(gamma, beta)` pair is zero. Folding the labels into one
+    representative first is what makes the target a function of `h` again.
+
+    Canonical form: flip the global sign so that the largest-magnitude gamma is positive,
+    then fold every beta into one period.
+    """
+    u = u.clone()
+    g, b = u[..., :DEPTH], u[..., DEPTH:]
+    lead = g.gather(-1, g.abs().argmax(dim=-1, keepdim=True))
+    u = torch.where(lead < 0, -u, u)
+    g, b = u[..., :DEPTH], u[..., DEPTH:]
+    return torch.cat([g, (b + 1.0) % 2.0 - 1.0], dim=-1)
+
+
 def to_angles(u, scale):
     """Normalised units -> radians for the simulator."""
     return u * scale

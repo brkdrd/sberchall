@@ -238,7 +238,19 @@ python -m src --set train_hours=1 --set val_restarts=64
 
 The notebook passes no arguments, by design.
 
-`main()` runs four stages, each printing under its own banner:
+`CONFIG["mode"]` picks which pipeline runs. `"proposer"` (the default) is the learned-restart
+experiment: **basins** (label which random starts flow to the optimum — the expensive stage,
+bounded by `basin_hours`) -> **proposer** (train `h -> K starts`) -> **validate** (propose K,
+Adam from each, select after polishing, and price the same budget spent on random starts).
+`basins.npz` is reused if it is already in the output directory, so a second run can skip
+straight to training — delete it to regenerate.
+
+Label quality is the thing to watch: a start is 'good' if it reached the *best P any start
+found for that instance*, so if `basin_starts` is too small the reference optimum is weak and
+the model learns to find mediocre basins. Prefer more starts on fewer instances over the
+reverse.
+
+`"rollout"` is the original learned-optimiser transformer, and runs four stages:
 
 - **preflight** — device, data, and the measured angle scale. Expect a span near 39, a gamma
   unit near 0.16 rad, a beta unit of pi/2, and a ratio near 10x; if those look wrong, stop

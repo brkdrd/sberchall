@@ -30,9 +30,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import basins as basins_mod
+from . import proposer as proposer_mod
 from . import train as train_mod
 from . import validate as validate_mod
-from .angles import angle_scale, energy_span
+from .angles import angle_scale, energy_span, to_angles
+from .predict import write_submission
 from .qaoa_ref import QAOA, P as DEPTH
 
 REPO = Path(__file__).resolve().parents[1]
@@ -41,9 +44,28 @@ REPO = Path(__file__).resolve().parents[1]
 # The experiment. This dict is the knob — edit it, commit, re-run the notebook.
 # --------------------------------------------------------------------------------------
 CONFIG = {
-    "name": "norm",         # names the run directory when not on Kaggle
+    "name": "proposer",     # names the run directory when not on Kaggle
+    "mode": "proposer",     # "proposer" = learned restarts; "rollout" = learned optimiser
+    "seed": 0,
 
-    # training
+    # ---- mode="proposer" -------------------------------------------------------------
+    # stage 1: label which random starts flow to the optimum (the expensive stage)
+    "basin_hours": 3.0,     # wall-clock budget; partial output is kept and usable
+    "basin_instances": 4000,
+    "basin_starts": 256,    # random starts run per instance
+    "basin_steps": 150,     # Adam steps per start
+    "basin_rel_tol": 0.02,  # 'good' = final P within this of the instance's best
+    # stage 2: train h -> K starts against those labels
+    "prop_iters": 6000,
+    "prop_k": 10,           # starts proposed per instance
+    "prop_batch": 256,
+    "prop_lr": 1e-3,
+    "prop_coverage": 1.0,   # weight on the diversity half of the Chamfer loss
+    "prop_eval_every": 1000,
+    # stage 3: inference — propose K, Adam from each, select after polishing
+    "infer_polish": 300,
+
+    # ---- mode="rollout" --------------------------------------------------------------
     "train_hours": 6.0,     # wall-clock budget; the real control, not `iters`
     "iters": 12000,         # upper bound — the clock usually binds first
     "batch": 128,
@@ -51,9 +73,6 @@ CONFIG = {
     "lr": 3e-4,
     "eval_every": 500,      # also the checkpoint interval
     "eval_restarts": 16,
-    "seed": 0,
-
-    # inference / validation
     "val_restarts": 256,
     "val_polish": 100,
     "val_top_m": 16,
@@ -62,6 +81,13 @@ CONFIG = {
 # Applied on top of CONFIG by `--quick`: exercises every stage in a few minutes.
 QUICK = {
     "name": "quick",
+    "basin_hours": 0.05,
+    "basin_instances": 32,
+    "basin_starts": 16,
+    "basin_steps": 40,
+    "prop_iters": 200,
+    "prop_eval_every": 100,
+    "infer_polish": 40,
     "train_hours": 0.08,
     "iters": 200,
     "eval_every": 100,
@@ -174,6 +200,45 @@ def summarise(submission, data_dir, device):
             "distinct_rows": distinct, "n": len(A)}
 
 
+def stage(name):
+    print("\n" + "-" * 78 + f"\n[{name}]\n" + "-" * 78, flush=True)
+
+
+def validate_proposer(ckpt, data_dir, out, cfg, device):
+    """Propose K starts, run Adam from each, select after polishing.
+
+    Also prices the identical Adam budget spent on *random* starts. That comparison is
+    the whole experiment: the classical optimiser is doing the optimising either way, so
+    the only thing the model can contribute is a better place to begin.
+    """
+    model, scale, _ = proposer_mod.load_model(ckpt, device)
+    sim = QAOA(np.load(data_dir / "J.npy"), device=device)
+    h = torch.tensor(np.load(data_dir / "h_train.npy"), dtype=torch.float32, device=device)
+    n, k = h.shape[0], model.k
+
+    t0 = time.time()
+    with torch.no_grad():
+        u0 = model(h).transpose(0, 1)
+    u, p = proposer_mod.polish_from(sim, h, u0, scale, cfg["infer_polish"], 0.03, 4096)
+    secs = time.time() - t0
+    print(f"  learned best-of-{k}: mean P = {p.mean().item():.4f}   "
+          f"median = {p.median().item():.4f}   min = {p.min().item():.4f}   ({secs:.0f}s)",
+          flush=True)
+
+    r0 = proposer_mod.random_starts(k, n, device, cfg["seed"])
+    _, pr = proposer_mod.polish_from(sim, h, r0, scale, cfg["infer_polish"], 0.03, 4096)
+    lift = p.mean().item() / max(pr.mean().item(), 1e-12)
+    print(f"   random best-of-{k}: mean P = {pr.mean().item():.4f}   "
+          f"-> learned starts are {lift:.3f}x", flush=True)
+
+    budget = "within" if secs < 600 else "OVER"
+    print(f"\ninference time: {secs:.0f}s — {budget} the 10-minute budget")
+    write_submission(out, to_angles(u, scale))
+    return {"submission": out, "mean_p": p.mean().item(), "median_p": p.median().item(),
+            "min_p": p.min().item(), "random_baseline": pr.mean().item(), "lift": lift,
+            "seconds": secs, "within_budget": secs < 600}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -201,32 +266,68 @@ def main(argv=None):
     banner(cfg, out_dir, args.device)
 
     scale_info = preflight(args.data_dir, args.device)
-
-    print("\n" + "-" * 78 + "\n[train]\n" + "-" * 78, flush=True)
-    tr = train_mod.main([
-        "--data-dir", str(args.data_dir), "--out-dir", str(out_dir),
-        "--iters", str(cfg["iters"]), "--max-hours", str(cfg["train_hours"]),
-        "--batch", str(cfg["batch"]), "--steps", str(cfg["steps"]), "--lr", str(cfg["lr"]),
-        "--eval-every", str(cfg["eval_every"]), "--eval-restarts", str(cfg["eval_restarts"]),
-        "--seed", str(cfg["seed"]), "--device", args.device,
-    ])
-    ckpt = Path(tr["best_ckpt"])
-    if not ckpt.exists():
-        raise RuntimeError("no checkpoint written — training died before the first eval")
-
     submission = out_dir / "submission_train.csv"
-    print("\n" + "-" * 78 + "\n[validate]\n" + "-" * 78, flush=True)
-    va = validate_mod.main([
-        "--ckpt", str(ckpt), "--data-dir", str(args.data_dir),
-        "--h", str(args.data_dir / "h_train.npy"),
-        "--restarts", str(cfg["val_restarts"]), "--polish", str(cfg["val_polish"]),
-        "--top-m", str(cfg["val_top_m"]), "--out", str(submission), "--device", args.device,
-    ])
+    extra = {}
 
-    print("\n" + "-" * 78 + "\n[summary]\n" + "-" * 78, flush=True)
+    if cfg["mode"] == "proposer":
+        npz = out_dir / "basins.npz"
+        if npz.exists():
+            print(f"\n[basins] reusing {npz} — delete it to regenerate", flush=True)
+        else:
+            stage("basins")
+            basins_mod.main([
+                "--data-dir", str(args.data_dir), "--out", str(npz),
+                "--instances", str(cfg["basin_instances"]),
+                "--starts", str(cfg["basin_starts"]), "--steps", str(cfg["basin_steps"]),
+                "--rel-tol", str(cfg["basin_rel_tol"]),
+                "--max-hours", str(cfg["basin_hours"]),
+                "--seed", str(cfg["seed"]), "--device", args.device,
+            ])
+
+        stage("proposer")
+        tr = proposer_mod.main([
+            "--basins", str(npz), "--data-dir", str(args.data_dir),
+            "--out-dir", str(out_dir), "--k", str(cfg["prop_k"]),
+            "--iters", str(cfg["prop_iters"]), "--batch", str(cfg["prop_batch"]),
+            "--lr", str(cfg["prop_lr"]), "--coverage", str(cfg["prop_coverage"]),
+            "--eval-every", str(cfg["prop_eval_every"]),
+            "--polish-steps", str(cfg["infer_polish"]),
+            "--seed", str(cfg["seed"]), "--device", args.device,
+        ])
+        ckpt = Path(tr["best_ckpt"])
+        if not ckpt.exists():
+            raise RuntimeError("no proposer checkpoint — training died before the first eval")
+
+        stage("validate")
+        va = validate_proposer(ckpt, args.data_dir, submission, cfg, args.device)
+        extra["random_baseline"] = va["random_baseline"]
+    else:
+        stage("train")
+        tr = train_mod.main([
+            "--data-dir", str(args.data_dir), "--out-dir", str(out_dir),
+            "--iters", str(cfg["iters"]), "--max-hours", str(cfg["train_hours"]),
+            "--batch", str(cfg["batch"]), "--steps", str(cfg["steps"]), "--lr", str(cfg["lr"]),
+            "--eval-every", str(cfg["eval_every"]),
+            "--eval-restarts", str(cfg["eval_restarts"]),
+            "--seed", str(cfg["seed"]), "--device", args.device,
+        ])
+        ckpt = Path(tr["best_ckpt"])
+        if not ckpt.exists():
+            raise RuntimeError("no checkpoint written — training died before the first eval")
+
+        stage("validate")
+        va = validate_mod.main([
+            "--ckpt", str(ckpt), "--data-dir", str(args.data_dir),
+            "--h", str(args.data_dir / "h_train.npy"),
+            "--restarts", str(cfg["val_restarts"]), "--polish", str(cfg["val_polish"]),
+            "--top-m", str(cfg["val_top_m"]), "--out", str(submission),
+            "--device", args.device,
+        ])
+
+    stage("summary")
     sm = summarise(submission, args.data_dir, args.device)
 
-    summary = {"commit": git_sha(), "config": cfg, "scale": scale_info,
+    summary = {"commit": git_sha(), "config": cfg, "scale": scale_info, **extra,
                "train": {k: (str(v) if isinstance(v, Path) else v) for k, v in tr.items()},
                "validate": {k: (str(v) if isinstance(v, Path) else v) for k, v in va.items()},
                "submission": sm, "total_seconds": time.time() - t0}
