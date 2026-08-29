@@ -55,6 +55,7 @@ CONFIG = {
     "basin_starts": 256,    # random starts run per instance
     "basin_steps": 150,     # Adam steps per start
     "basin_rel_tol": 0.02,  # 'good' = final P within this of the instance's best
+    "basin_init": "tqa",    # "uniform" = the old 10-D box; "tqa"/"ramp" = smooth schedules
     # stage 2: train h -> K starts against those labels
     "prop_iters": 6000,
     "prop_k": 10,           # starts proposed per instance
@@ -286,6 +287,7 @@ def main(argv=None):
                 "--instances", str(cfg["basin_instances"]),
                 "--starts", str(cfg["basin_starts"]), "--steps", str(cfg["basin_steps"]),
                 "--rel-tol", str(cfg["basin_rel_tol"]),
+                "--init", str(cfg["basin_init"]),
                 "--max-hours", str(cfg["basin_hours"]),
                 "--seed", str(cfg["seed"]), "--device", args.device,
             ])
@@ -298,6 +300,7 @@ def main(argv=None):
             "--lr", str(cfg["prop_lr"]), "--coverage", str(cfg["prop_coverage"]),
             "--eval-every", str(cfg["prop_eval_every"]),
             "--polish-steps", str(cfg["infer_polish"]),
+            "--init", str(cfg["basin_init"]),
             "--seed", str(cfg["seed"]), "--device", args.device,
         ])
         ckpt = Path(tr["best_ckpt"])

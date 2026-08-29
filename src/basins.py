@@ -34,6 +34,7 @@ import torch
 from .angles import DEPTH, angle_scale, canonicalise, to_angles
 from .predict import polish
 from .qaoa_ref import QAOA
+from .schedules import sample_starts
 
 
 def p_of(sim, h, u, scale):
@@ -42,7 +43,7 @@ def p_of(sim, h, u, scale):
         return sim.p_ground(h, a[:, :DEPTH], a[:, DEPTH:])
 
 
-def run_starts(sim, h, scale, n_starts, steps, lr, chunk, generator):
+def run_starts(sim, h, scale, n_starts, steps, lr, chunk, generator, init="tqa"):
     """Adam from `n_starts` canonical random starts per instance.
 
     Starts are batched together rather than run one at a time: every start is an
@@ -58,9 +59,7 @@ def run_starts(sim, h, scale, n_starts, steps, lr, chunk, generator):
     starts, ends, ps = [], [], []
     for lo in range(0, n_starts, per):
         s = min(per, n_starts - lo)
-        u0 = canonicalise(
-            torch.rand(s * n, 2 * DEPTH, device=h.device, generator=generator) * 2 - 1
-        )
+        u0 = sample_starts(s * n, init, h.device, generator)
         hr = h.repeat(s, 1)                        # [h; h; ...] -> row = start * N + inst
         u1 = polish(sim, hr, u0, scale, steps, lr=lr, chunk=chunk)
         starts.append(u0.view(s, n, -1))
@@ -124,6 +123,9 @@ def main(argv=None):
                     help="wall-clock budget; 0 = unlimited. On expiry the labels gathered "
                          "so far are written, so the stage is always safe to cut short.")
     ap.add_argument("--chunk", type=int, default=4096, help="rows per Adam chunk")
+    ap.add_argument("--init", default="tqa", choices=("uniform", "tqa", "ramp"),
+                    help="where starts come from; 'uniform' is the old 10-D box, which "
+                         "misses the smooth-schedule surface the optima lie on")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args(argv)
@@ -136,7 +138,7 @@ def main(argv=None):
     scale = angle_scale(sim, h_ref, device=dev)
 
     print(f"generating {args.instances} instances x {args.starts} starts x {args.steps} "
-          f"Adam steps on {dev}", flush=True)
+          f"Adam steps on {dev}  (init={args.init})", flush=True)
     out = {k: [] for k in ("h", "best_p", "start", "owner", "basin", "p_end")}
     t0, done = time.time(), 0
     budget_s = args.max_hours * 3600 if args.max_hours else None
@@ -145,7 +147,7 @@ def main(argv=None):
         # training instances are synthesised: h_train is i.i.d. U(-1, 1) and held out
         h = torch.rand(n, h_ref.shape[1], device=dev, generator=gen) * 2 - 1
         starts, ends, ps = run_starts(sim, h, scale, args.starts, args.steps, args.lr,
-                                      args.chunk, gen)
+                                      args.chunk, gen, init=args.init)
         owner, u0, p_end, basin, best = label(starts, ends, ps, args.rel_tol,
                                               args.basin_eps)
         out["h"].append(h.cpu().numpy())

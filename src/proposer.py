@@ -37,6 +37,7 @@ from .angles import DEPTH, angle_scale, canonicalise, to_angles
 from .model import COND_DIM
 from .predict import polish
 from .qaoa_ref import QAOA
+from .schedules import sample_starts
 
 N_ANGLES = 2 * DEPTH
 GAMMA_BOX = 3.0        # tanh bound on gamma in normalised units; beta needs only one period
@@ -151,13 +152,19 @@ def polish_from(sim, h, u0, scale, steps, lr, chunk):
 
 
 @torch.no_grad()
-def random_starts(k, n, device, seed):
+def random_starts(k, n, device, seed, init="tqa"):
+    """The non-learned arm of the comparison.
+
+    This must use the *same* init family the labels came from, or the head-to-head is a
+    strawman: beating uniform-box starts is easy and proves nothing once we know the box
+    is the wrong place to sample from.
+    """
     g = torch.Generator(device=device).manual_seed(seed)
-    return canonicalise(torch.rand(k, n, N_ANGLES, device=device, generator=g) * 2 - 1)
+    return sample_starts(k * n, init, device, g).view(k, n, N_ANGLES)
 
 
 @torch.no_grad()
-def head_to_head(model, sim, h, scale, steps, lr, chunk, seed=0):
+def head_to_head(model, sim, h, scale, steps, lr, chunk, seed=0, init="tqa"):
     """The only evaluation that matters: learned starts vs the same number of random ones.
 
     Both arms get an identical Adam budget, so any difference is the starts alone.
@@ -165,7 +172,8 @@ def head_to_head(model, sim, h, scale, steps, lr, chunk, seed=0):
     model.eval()
     k, n = model.k, h.shape[0]
     _, pl = polish_from(sim, h, model(h).transpose(0, 1), scale, steps, lr, chunk)
-    _, pr = polish_from(sim, h, random_starts(k, n, h.device, seed), scale, steps, lr, chunk)
+    _, pr = polish_from(sim, h, random_starts(k, n, h.device, seed, init), scale, steps,
+                        lr, chunk)
     model.train()
     return {"learned": pl.mean().item(), "random": pr.mean().item()}
 
@@ -199,6 +207,8 @@ def main(argv=None):
     ap.add_argument("--polish-steps", type=int, default=150)
     ap.add_argument("--polish-lr", type=float, default=0.03)
     ap.add_argument("--chunk", type=int, default=4096)
+    ap.add_argument("--init", default="tqa", choices=("uniform", "tqa", "ramp"),
+                    help="init family for the non-learned baseline arm")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args(argv)
@@ -237,7 +247,7 @@ def main(argv=None):
 
         if it % args.eval_every == 0 or it == args.iters:
             r = head_to_head(model, sim, h_eval, scale, args.polish_steps, args.polish_lr,
-                             args.chunk, seed=args.seed)
+                             args.chunk, seed=args.seed, init=args.init)
             lift = r["learned"] / max(r["random"], 1e-12)
             print(f"eval  iter {it}: best-of-{args.k} P — learned {r['learned']:.4f}  "
                   f"vs random {r['random']:.4f}   ({lift:.3f}x)", flush=True)
