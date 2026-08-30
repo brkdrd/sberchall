@@ -71,6 +71,8 @@ CONFIG = {
     # ---- mode="turbo" ----------------------------------------------------------------
     # Pure inference-time search: nothing is trained, so a run is one pass over h.
     "turbo_evals": 400,     # circuit evaluations per instance -- the real budget knob
+    "turbo_hours": 0.0,     # wall-clock cap on the search; 0 = unlimited. Set both high
+                            # for a diagnostic run that ignores the 10-minute limit.
     "turbo_n_tr": 2,        # independent trust regions per instance
     "turbo_n_cand": 192,    # Thompson candidates drawn per region per step
     "turbo_polish": 200,    # final Adam steps on TuRBO's best point
@@ -296,6 +298,7 @@ def main(argv=None):
         va = turbo_mod.main([
             "--data-dir", str(args.data_dir), "--out", str(submission),
             "--evals", str(cfg["turbo_evals"]), "--n-tr", str(cfg["turbo_n_tr"]),
+            "--max-hours", str(cfg["turbo_hours"]),
             "--n-cand", str(cfg["turbo_n_cand"]), "--polish", str(cfg["turbo_polish"]),
             "--baseline-starts", str(cfg["turbo_baselines"]),
             "--seed", str(cfg["seed"]), "--device", args.device,

@@ -41,6 +41,8 @@ Usage:
 import argparse
 import math
 import time
+from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +54,17 @@ from .qaoa_ref import QAOA
 from .schedules import sample_starts, tqa_units
 
 N_ANGLES = 2 * DEPTH
+TIMERS = defaultdict(float)
+
+
+@contextmanager
+def timed(key):
+    """Where the wall clock goes. BO trades surrogate overhead for fewer evaluations, so
+    on a problem with *cheap* evaluations the split between the two is the whole verdict."""
+    t = time.time()
+    yield
+    TIMERS[key] += time.time() - t
+
 GAMMA_BOX = 3.0          # search box half-width for gamma, in normalised units
 BETA_BOX = 1.0           # exactly one mixer period -- no point searching further
 SQRT5 = math.sqrt(5.0)
@@ -239,10 +252,11 @@ def make_objective(sim, h, scale, n_tr, chunk=8192):
         u = from_unit(x_unit.reshape(-1, d).float(), lo, hi)
         hh = (h_rep if idx is None else h_rep[idx]).repeat_interleave(m, dim=0)
         out = []
-        for s in range(0, u.shape[0], chunk):
-            a = to_angles(u[s:s + chunk], scale)
-            p = sim.p_ground(hh[s:s + chunk], a[:, :DEPTH], a[:, DEPTH:])
-            out.append(torch.log(p.clamp_min(1e-12)))
+        with timed("circuit"):
+            for s in range(0, u.shape[0], chunk):
+                a = to_angles(u[s:s + chunk], scale)
+                p = sim.p_ground(hh[s:s + chunk], a[:, :DEPTH], a[:, DEPTH:])
+                out.append(torch.log(p.clamp_min(1e-12)))
         counter["evals"] += u.shape[0]
         return torch.cat(out).view(b, m).double()
 
@@ -284,24 +298,31 @@ def run(sim, h, scale, args, gen):
 
     t0, it = time.time(), 0
     budget = args.evals * n
+    deadline = args.max_hours * 3600 if args.max_hours else None
+    curve = []
     while counter["evals"] < budget:
+        if deadline and time.time() - t0 > deadline:
+            print(f"  wall-clock budget of {args.max_hours:g} h reached at "
+                  f"{counter['evals'] // n} evals/instance -- stopping", flush=True)
+            break
         it += 1
-        if it % args.hp_every == 1 or it == 1:
-            l1, o1, n1 = fit_hypers(tb.X, standardise(tb.y, tb.valid), tb.valid,
-                                    ls[:1].squeeze(0), osc[:1], nsc[:1],
-                                    steps=args.hp_steps, sub=args.hp_sub, gen=gen)
-            ls, osc, nsc = l1.expand(tb.b, -1), o1.expand(tb.b), n1.expand(tb.b)
+        with timed("surrogate"):
+            if it % args.hp_every == 1 or it == 1:
+                l1, o1, n1 = fit_hypers(tb.X, standardise(tb.y, tb.valid), tb.valid,
+                                        ls[:1].squeeze(0), osc[:1], nsc[:1],
+                                        steps=args.hp_steps, sub=args.hp_sub, gen=gen)
+                ls, osc, nsc = l1.expand(tb.b, -1), o1.expand(tb.b), n1.expand(tb.b)
 
-        ystd = standardise(tb.y, tb.valid)
-        L, alpha = gp_factor(tb.X, ystd, tb.valid, ls, osc, nsc)
-        xc = tb.candidates(ls, args.n_cand)
-        mu, var = gp_predict(xc, tb.X, L, alpha, tb.valid, ls, osc)
-        # Thompson sampling on independent marginals -- the joint draw TuRBO specifies
-        # needs an (n_cand x n_cand) Cholesky per region, which does not batch at this size
-        draw = mu + var.sqrt() * torch.randn(mu.shape, device=dev, dtype=torch.float64,
-                                             generator=gen)
-        pick = draw.topk(args.batch, dim=1).indices
-        xs = torch.gather(xc, 1, pick.unsqueeze(-1).expand(-1, -1, N_ANGLES))
+            ystd = standardise(tb.y, tb.valid)
+            L, alpha = gp_factor(tb.X, ystd, tb.valid, ls, osc, nsc)
+            xc = tb.candidates(ls, args.n_cand)
+            mu, var = gp_predict(xc, tb.X, L, alpha, tb.valid, ls, osc)
+            # Thompson sampling on independent marginals -- the joint draw TuRBO specifies
+            # needs an (n_cand x n_cand) Cholesky per region, which does not batch here
+            draw = mu + var.sqrt() * torch.randn(mu.shape, device=dev, dtype=torch.float64,
+                                                 generator=gen)
+            pick = draw.topk(args.batch, dim=1).indices
+            xs = torch.gather(xc, 1, pick.unsqueeze(-1).expand(-1, -1, N_ANGLES))
         ys = f(xs)
 
         _, prev = tb.best()
@@ -315,15 +336,18 @@ def run(sim, h, scale, args, gen):
         if it % args.log_every == 0:
             xb, yb = tb.best()
             pb = yb.view(args.n_tr, n).max(dim=0).values.exp()
-            print(f"  it {it:4d}  evals/inst {counter['evals'] // n:6d}  "
-                  f"mean P {pb.mean():.4f}  median L {tb.L.median():.4f}  "
-                  f"restarts {tb.restarts}  {time.time() - t0:5.0f}s", flush=True)
+            curve.append((counter["evals"] // n, pb.mean().item(), pb.median().item(),
+                          time.time() - t0))
+            print(f"  it {it:4d}  evals/inst {counter['evals'] // n:7d}  "
+                  f"mean P {pb.mean():.4f}  median {pb.median():.4f}  "
+                  f"L {tb.L.median():.4f}  restarts {tb.restarts}  "
+                  f"{time.time() - t0:6.0f}s", flush=True)
 
     xb, yb = tb.best()
     xb = xb.view(args.n_tr, n, N_ANGLES)
     best_tr = yb.view(args.n_tr, n).argmax(dim=0)
     u = from_unit(xb[best_tr, torch.arange(n, device=dev)].float(), lo, hi)
-    return u, counter["evals"] // n, tb.restarts
+    return u, counter["evals"] // n, tb.restarts, curve
 
 
 def standardise(y, valid):
@@ -357,6 +381,10 @@ def main(argv=None):
     ap.add_argument("--h", type=Path, default=None, help="default: data-dir/h_train.npy")
     ap.add_argument("--out", type=Path, default=Path("runs/turbo_submission.csv"))
     ap.add_argument("--evals", type=int, default=400, help="circuit evals per instance")
+    ap.add_argument("--max-hours", type=float, default=0.0,
+                    help="wall-clock cap on the SEARCH; 0 = unlimited. Raise `evals` and "
+                         "this together for a diagnostic run that deliberately blows the "
+                         "10-minute inference limit, to see where the method saturates.")
     ap.add_argument("--n-tr", type=int, default=2, help="trust regions per instance")
     ap.add_argument("--n-init", type=int, default=20, help="initial design per region")
     ap.add_argument("--n-cand", type=int, default=192, help="Thompson candidates per step")
@@ -386,7 +414,7 @@ def main(argv=None):
     print(f"TuRBO on {h.shape[0]} instances | {args.n_tr} trust regions each | "
           f"{args.evals} circuit evals per instance | {dev}", flush=True)
     t0 = time.time()
-    u, used, restarts = run(sim, h, scale, args, gen)
+    u, used, restarts, curve = run(sim, h, scale, args, gen)
     p_bo = score(sim, h, u, scale)
     t_bo = time.time() - t0
     print(f"\nTuRBO alone            : mean P {p_bo.mean():.5f}  median {p_bo.median():.5f}"
@@ -398,18 +426,48 @@ def main(argv=None):
     print(f"TuRBO + {args.polish} Adam steps : mean P {p_hy.mean():.5f}  "
           f"median {p_hy.median():.5f}   ({t_all:.0f}s)", flush=True)
 
-    for kind in ("tqa", "uniform"):
-        pb = baseline(sim, h, scale, kind, args.baseline_starts, args.polish, gen, args.chunk)
-        print(f"{kind:>7} x{args.baseline_starts} + Adam    : mean P {pb.mean():.5f}  "
-              f"median {pb.median():.5f}", flush=True)
+    base = {}
+    if args.baseline_starts > 0:
+        for kind in ("tqa", "uniform"):
+            pb = baseline(sim, h, scale, kind, args.baseline_starts, args.polish, gen,
+                          args.chunk)
+            base[kind] = pb.mean().item()
+            print(f"{kind:>7} x{args.baseline_starts} + Adam    : mean P {pb.mean():.5f}  "
+                  f"median {pb.median():.5f}", flush=True)
 
-    budget = "within" if t_all < 600 else "OVER"
-    print(f"\ntotal {t_all:.0f}s — {budget} the 10-minute inference budget")
+    # Per-instance spread, not the mean, is where the signal is: a method whose best
+    # instance clears the leaderboard while its median sits at a third of that is not
+    # short of power, it is failing to deliver it consistently.
+    levels = [10, 25, 50, 75, 90]
+    qq = torch.quantile(p_hy, torch.tensor([l / 100 for l in levels],
+                                           device=p_hy.device, dtype=p_hy.dtype))
+    print("\nper-instance P(ground) distribution:")
+    print("   " + "  ".join(f"p{l:02d} {v:.4f}" for l, v in zip(levels, qq.tolist()))
+          + f"  max {p_hy.max().item():.4f}")
+
+    if curve:
+        print("\nscaling curve — is more budget still buying anything?")
+        print(f"   {'evals/inst':>11} {'mean P':>9} {'median P':>9} {'sec':>7}")
+        step = max(1, len(curve) // 12)
+        for e, m, md, t in curve[::step] + [curve[-1]]:
+            print(f"   {e:>11} {m:>9.4f} {md:>9.4f} {t:>7.0f}")
+
+    tot = sum(TIMERS.values()) or 1.0
+    print("\nwhere the time went:")
+    for k, v in sorted(TIMERS.items(), key=lambda kv: -kv[1]):
+        print(f"   {k:>10} {v:7.0f}s  ({v / tot:5.1%})")
+    print(f"   {'other':>10} {t_all - tot:7.0f}s")
+
+    budget = "within" if t_all < 600 else "OVER — diagnostic run, not a submission"
+    print(f"\ntotal {t_all:.0f}s — {budget} the 10-minute inference limit")
     print("reference: proposer 0.18405 | multistart nb 03 0.32396 | leaderboard #1 0.81468")
     write_submission(args.out, to_angles(u, scale))
     return {"submission": args.out, "mean_p": p_hy.mean().item(),
             "mean_p_no_polish": p_bo.mean().item(), "seconds": t_all,
-            "evals_per_instance": used, "restarts": restarts}
+            "evals_per_instance": used, "restarts": restarts,
+            "quantiles": dict(zip([f"p{l}" for l in levels], qq.tolist())),
+            "max_p": p_hy.max().item(),
+            "baselines": base, "curve": curve, "timers": dict(TIMERS)}
 
 
 if __name__ == "__main__":
