@@ -30,6 +30,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import anytime as anytime_mod
 from . import basins as basins_mod
 from . import proposer as proposer_mod
 from . import train as train_mod
@@ -46,7 +47,9 @@ REPO = Path(__file__).resolve().parents[1]
 # --------------------------------------------------------------------------------------
 CONFIG = {
     "name": "proposer",     # names the run directory when not on Kaggle
-    "mode": "turbo",        # "turbo" = trust-region BO (no training stage at all);
+    "mode": "anytime",      # "anytime" = per-instance budget/quality profiling (no
+                            # submission -- it is an analysis run);
+                            # "turbo" = trust-region BO (no training stage at all);
                             # "proposer" = learned restarts; "rollout" = learned optimiser
     "seed": 0,
 
@@ -67,6 +70,16 @@ CONFIG = {
     "prop_eval_every": 1000,
     # stage 3: inference — propose K, Adam from each, select after polishing
     "infer_polish": 300,
+
+    # ---- mode="anytime" --------------------------------------------------------------
+    # Answers "how much budget does an instance need, and when do we stop paying?"
+    # Writes runs/anytime.npz (per-instance curves) + a png, and no submission.
+    "anytime_extra": 1500,    # generated instances on top of the 500 in h_train
+    "anytime_restarts": 20,
+    "anytime_steps": 300,     # Adam steps per restart -> 6000 steps/instance total
+    "anytime_init": "tqa",    # start distribution under test
+    "anytime_hours": 2.0,     # wall-clock cap; partial profiles are still analysed
+    "anytime_block": 1000,    # instances resident on the GPU at once
 
     # ---- mode="turbo" ----------------------------------------------------------------
     # Pure inference-time search: nothing is trained, so a run is one pass over h.
@@ -101,6 +114,11 @@ CONFIG = {
 # Applied on top of CONFIG by `--quick`: exercises every stage in a few minutes.
 QUICK = {
     "name": "quick",
+    "anytime_extra": 24,
+    "anytime_restarts": 2,
+    "anytime_steps": 40,
+    "anytime_hours": 0.05,
+    "anytime_block": 256,
     "turbo_evals": 60,
     "turbo_hours": 0.0,
     "turbo_n_tr": 1,
@@ -302,6 +320,25 @@ def main(argv=None):
     scale_info = preflight(args.data_dir, args.device)
     submission = out_dir / "submission_train.csv"
     extra = {}
+
+    if cfg["mode"] == "anytime":
+        stage("anytime")
+        va = anytime_mod.main([
+            "--data-dir", str(args.data_dir), "--out", str(out_dir / "anytime.npz"),
+            "--extra", str(cfg["anytime_extra"]),
+            "--restarts", str(cfg["anytime_restarts"]),
+            "--steps", str(cfg["anytime_steps"]), "--init", str(cfg["anytime_init"]),
+            "--max-hours", str(cfg["anytime_hours"]), "--block", str(cfg["anytime_block"]),
+            "--seed", str(cfg["seed"]), "--device", args.device,
+        ])
+        summary = {"commit": git_sha(), "config": cfg, "scale": scale_info,
+                   "anytime": va, "total_seconds": time.time() - t0}
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+        print(f"\ntotal {(time.time() - t0) / 60:.1f} min. artefacts in {out_dir}:")
+        for f in sorted(out_dir.iterdir()):
+            if f.is_file():
+                print(f"  {f.name:<24} {f.stat().st_size / 1024:8.0f} KiB")
+        return summary
 
     if cfg["mode"] == "turbo":
         stage("turbo")

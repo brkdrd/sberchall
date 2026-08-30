@@ -248,6 +248,30 @@ python -m src --set train_hours=1 --set val_restarts=64
 
 The notebook passes no arguments, by design.
 
+### `mode = "anytime"` — how much budget does an instance need?
+
+An analysis run, not a submission: it writes `anytime.npz` (the full per-instance curve) and
+a `.png`, and no `submission_train.csv`. It profiles `h_train` plus `anytime_extra` freshly
+generated instances — `h_train` is i.i.d. U(-1,1), so the generated ones are drawn from the
+same law, and the two groups are reported separately as a check that they behave alike.
+
+**Budget is counted in Adam steps per instance, not seconds.** Everything runs batched, so no
+instance has a wall clock of its own; steps-per-instance is hardware-independent, and the
+measured throughput converts it back into seconds for a full 500-instance pass — the form the
+10-minute limit is written in.
+
+Four blocks of output, and they answer different questions:
+
+| block | question |
+|---|---|
+| heatmap | how the *distribution* of quality moves as budget grows, not just its mean |
+| mean/median vs budget | is another doubling of budget still buying anything |
+| time to reach a threshold | how many steps a given quality costs, and what share never get there |
+| when to stop | share of instances already within 95% of their own final value |
+
+The last one is the one to act on: once most instances have stopped improving, further budget
+is being spent on the few that never will.
+
 ### `mode = "turbo"` — trust-region Bayesian optimisation
 
 The default. **Nothing is trained**, so a run is a single pass over `h`: no basin stage, no
