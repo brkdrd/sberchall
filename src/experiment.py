@@ -47,9 +47,11 @@ REPO = Path(__file__).resolve().parents[1]
 # --------------------------------------------------------------------------------------
 CONFIG = {
     "name": "proposer",     # names the run directory when not on Kaggle
-    "mode": "anytime",      # "anytime" = per-instance budget/quality profiling (no
-                            # submission -- it is an analysis run);
-                            # "turbo" = trust-region BO (no training stage at all);
+    # NOTE: adding a new mode must never change this line. Doing so silently runs a
+    # different experiment than the one the last change was made for.
+    "mode": "turbo",        # "turbo" = trust-region BO (no training stage at all);
+                            # "anytime" = per-instance budget/quality profiling (an
+                            # analysis run -- writes no submission);
                             # "proposer" = learned restarts; "rollout" = learned optimiser
     "seed": 0,
 
