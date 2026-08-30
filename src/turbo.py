@@ -83,30 +83,43 @@ def matern52(A, B, ls):
 def gp_factor(X, y, valid, ls, outscale, noise):
     """Cholesky of the training covariance, and alpha = K^-1 y.
 
-    Invalid buffer slots are neutralised rather than removed, which keeps every instance
-    the same shape and so keeps the whole step batched: their rows and columns are zeroed
-    and their diagonal set to 1, making K block-diagonal (real block + identity). The
-    Cholesky inherits that structure, so those slots contribute exactly nothing to the
-    posterior while the tensor stays rectangular.
+    Invalid buffer slots are neutralised rather than removed, which keeps every instance the
+    same shape and so keeps the whole step batched: their rows and columns are zeroed and
+    their diagonal set to 1, making K block-diagonal (real block + identity). The Cholesky
+    inherits that structure, so those slots contribute nothing while the tensor stays
+    rectangular.
+
+    Jitter is **relative to the output scale**, escalated per failing batch element via
+    `cholesky_ex` rather than by re-running the whole batch. Absolute jitter is useless
+    here: the fitted output scale reaches 1e3, against which a 1e-2 ridge is nothing. A
+    region that still will not factorise falls back to its prior — degraded exploration for
+    that one region, rather than killing an hour-long run.
     """
     b, n, _ = X.shape
     vv = valid.unsqueeze(-1) & valid.unsqueeze(-2)
-    K = outscale.view(-1, 1, 1) * matern52(X, X, ls) * vv
-    diag = torch.where(valid, noise.view(-1, 1).expand(b, n), torch.ones_like(K[:, 0, :]))
-    K = K + torch.diag_embed(diag)
-    # Thompson sampling can propose a point twice, which makes K singular. Escalating
-    # jitter is cheaper and safer than losing a GPU-hour run to a LinAlgError.
-    for jitter in (0.0, 1e-8, 1e-6, 1e-4, 1e-2):
-        try:
-            L = torch.linalg.cholesky(
-                K + jitter * torch.eye(n, device=K.device, dtype=K.dtype))
-            if jitter >= 1e-4:
-                # at this level the jitter, not the data, is setting the posterior
-                TIMERS["_bad_jitter"] += 1
+    K0 = outscale.view(-1, 1, 1) * matern52(X, X, ls) * vv
+    diag = torch.where(valid, noise.view(-1, 1).expand(b, n), torch.ones_like(K0[:, 0, :]))
+    Kb = K0 + torch.diag_embed(diag)
+    eye = torch.eye(n, device=X.device, dtype=X.dtype)
+    mag = outscale.clamp_min(1e-6).view(-1, 1, 1)
+
+    L = torch.zeros_like(Kb)
+    pending = torch.ones(b, dtype=torch.bool, device=X.device)
+    for j in (0.0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1):
+        Lc, info = torch.linalg.cholesky_ex(Kb + (j * mag) * eye)
+        ok = (info == 0) & pending
+        if ok.any():
+            L[ok] = Lc[ok]
+            pending = pending & ~ok
+        if not pending.any():
             break
-        except Exception:
-            if jitter == 1e-2:
-                raise
+        if j >= 1e-3:
+            TIMERS["_bad_jitter"] += int(pending.sum())
+    if pending.any():
+        # prior only: L = sqrt(outscale * n) I gives alpha ~ 0 and var ~ outscale
+        TIMERS["_gp_prior"] += int(pending.sum())
+        L = torch.where(pending.view(-1, 1, 1), (mag * n).sqrt() * eye, L)
+
     alpha = torch.cholesky_solve((y * valid).unsqueeze(-1), L)
     return L, alpha
 
@@ -148,7 +161,7 @@ def fit_hypers(X, y, valid, ls, outscale, noise, steps=30, lr=0.08, sub=96, gen=
         opt.zero_grad()
         lsv = p_ls.exp().clamp(1e-2, 10.0).expand(len(idx), -1)
         osv = p_os.exp().clamp(1e-3, 1e3).expand(len(idx))
-        nov = p_no.exp().clamp(1e-6, 1.0).expand(len(idx))
+        nov = p_no.exp().clamp(1e-4, 1.0).expand(len(idx))
         L, alpha = gp_factor(Xs, ys, vs, lsv, osv, nov)
         fit = 0.5 * ((ys * vs).unsqueeze(-1) * alpha).sum(dim=(1, 2))
         cplx = torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=1)
@@ -157,7 +170,7 @@ def fit_hypers(X, y, valid, ls, outscale, noise, steps=30, lr=0.08, sub=96, gen=
     with torch.no_grad():
         return (p_ls.exp().clamp(1e-2, 10.0).detach(),
                 p_os.exp().clamp(1e-3, 1e3).detach(),
-                p_no.exp().clamp(1e-6, 1.0).detach())
+                p_no.exp().clamp(1e-4, 1.0).detach())
 
 
 # ----------------------------------------------------------------------------------
@@ -233,8 +246,8 @@ class Turbo:
         self.ptr[mask] = 0
         self.restarts += int(mask.sum())
 
-    def candidates(self, ls, n_cand):
-        """Perturb each region's incumbent inside a box scaled by the GP lengthscales.
+    def frame(self, ls):
+        """Trust-region centre and per-dimension side lengths.
 
         Anisotropic scaling is the part of TuRBO that matters most here: gamma and beta
         have natural scales an order of magnitude apart, so an isotropic region would be
@@ -243,11 +256,27 @@ class Turbo:
         c, _ = self.best()
         w = ls / ls.prod(dim=1, keepdim=True).pow(1.0 / self.d)
         side = (self.L.unsqueeze(1) * w).clamp(1e-4, 1.0)
+        return c, side
+
+    def candidates(self, c, side, n_cand):
+        """Uniform points inside the region, in absolute [0,1]^d coordinates."""
         lo = (c - side / 2).clamp(0, 1)
         hi = (c + side / 2).clamp(0, 1)
         r = torch.rand(self.b, n_cand, self.d, device=self.device,
                        dtype=self.dtype, generator=self.gen)
         return lo.unsqueeze(1) + r * (hi - lo).unsqueeze(1)
+
+    def normalise(self, x, c, side):
+        """Absolute coordinates -> units of this region's own frame.
+
+        This is what keeps the GP conditioned. Lengthscales are shared across regions and
+        refit only every `hp_every` steps, so once a region shrinks to L=0.1 its stored
+        points all sit far inside one shared lengthscale, every kernel entry approaches 1,
+        and the matrix goes singular by construction — which is exactly how an hour-long
+        run died. Measured in the region's own frame, the points stay spread over roughly
+        [-0.5, 0.5] no matter how small the region gets.
+        """
+        return (x - c.unsqueeze(1)) / side.unsqueeze(1)
 
 
 def make_objective(sim, h, scale, n_tr, chunk=8192, dtype=torch.float64):
@@ -303,7 +332,7 @@ def run(sim, h, scale, args, gen):
         tb.add(xs, f(xs, idx), idx)
 
     seed()
-    ls = torch.ones(tb.b, N_ANGLES, device=dev, dtype=dt) * 0.3
+    ls = torch.ones(tb.b, N_ANGLES, device=dev, dtype=dt) * 0.4
     osc = torch.ones(tb.b, device=dev, dtype=dt)
     nsc = torch.full((tb.b,), 1e-3, device=dev, dtype=dt)
 
@@ -319,15 +348,24 @@ def run(sim, h, scale, args, gen):
         it += 1
         with timed("surrogate"):
             if it % args.hp_every == 1 or it == 1:
-                l1, o1, n1 = fit_hypers(tb.X, standardise(tb.y, tb.valid), tb.valid,
+                c0, s0 = tb.frame(ls)
+                Xh = torch.where(tb.valid.unsqueeze(-1), tb.normalise(tb.X, c0, s0),
+                                 torch.zeros((), device=dev, dtype=dt))
+                l1, o1, n1 = fit_hypers(Xh, standardise(tb.y, tb.valid), tb.valid,
                                         ls[:1].squeeze(0), osc[:1], nsc[:1],
                                         steps=args.hp_steps, sub=args.hp_sub, gen=gen)
                 ls, osc, nsc = l1.expand(tb.b, -1), o1.expand(tb.b), n1.expand(tb.b)
 
             ystd = standardise(tb.y, tb.valid)
-            L, alpha = gp_factor(tb.X, ystd, tb.valid, ls, osc, nsc)
-            xc = tb.candidates(ls, args.n_cand)
-            mu, var = gp_predict(xc, tb.X, L, alpha, tb.valid, ls, osc, args.gp_chunk)
+            c_tr, side = tb.frame(ls)
+            # invalid slots are masked out of the kernel anyway; zero them so they cannot
+            # blow up the distance computation once divided by a tiny side length
+            Xn = torch.where(tb.valid.unsqueeze(-1), tb.normalise(tb.X, c_tr, side),
+                             torch.zeros((), device=dev, dtype=dt))
+            L, alpha = gp_factor(Xn, ystd, tb.valid, ls, osc, nsc)
+            xc = tb.candidates(c_tr, side, args.n_cand)
+            mu, var = gp_predict(tb.normalise(xc, c_tr, side), Xn, L, alpha, tb.valid,
+                                 ls, osc, args.gp_chunk)
             # One realisation per batch slot, each contributing its own argmax -- this is
             # TuRBO's batch rule. Taking the top-q of a SINGLE realisation instead would
             # return q points clustered around the same peak, which is harmless at q=4 and
@@ -475,16 +513,17 @@ def main(argv=None):
             print(f"   {e:>11} {m:>9.4f} {md:>9.4f} {t:>7.0f}")
 
     bad = TIMERS.pop("_bad_jitter", 0)
+    prior = TIMERS.pop("_gp_prior", 0)
     tot = sum(TIMERS.values()) or 1.0
     print("\nwhere the time went:")
     for k, v in sorted(TIMERS.items(), key=lambda kv: -kv[1]):
         print(f"   {k:>10} {v:7.0f}s  ({v / tot:5.1%})")
     print(f"   {'other':>10} {t_all - tot:7.0f}s")
 
-    if bad:
-        print(f"\nWARNING: {int(bad)} GP solves needed jitter >= 1e-4 to factorise. At that "
-              f"level the jitter is setting the posterior, not the data — if this is large, "
-              f"rerun with --gp-dtype float64.")
+    if bad or prior:
+        print(f"\nGP conditioning: {int(bad)} region-solves needed jitter >= 1e-3, "
+              f"{int(prior)} fell back to the prior. Small counts are normal as trust "
+              f"regions shrink; large ones mean --gp-dtype float64 is warranted.")
     budget = "within" if t_all < 600 else "OVER — diagnostic run, not a submission"
     print(f"\ntotal {t_all:.0f}s — {budget} the 10-minute inference limit")
     print("reference: proposer 0.18405 | multistart nb 03 0.32396 | leaderboard #1 0.81468")
