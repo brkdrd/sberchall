@@ -70,13 +70,20 @@ CONFIG = {
 
     # ---- mode="turbo" ----------------------------------------------------------------
     # Pure inference-time search: nothing is trained, so a run is one pass over h.
-    "turbo_evals": 400,     # circuit evaluations per instance -- the real budget knob
-    "turbo_hours": 0.0,     # wall-clock cap on the search; 0 = unlimited. Set both high
-                            # for a diagnostic run that ignores the 10-minute limit.
+    # This is currently configured as a DIAGNOSTIC run: it deliberately exceeds the
+    # 10-minute inference limit to find where the method saturates. `turbo_evals` at 400
+    # and `turbo_hours` at 0 is the submission-legal setting.
+    "turbo_evals": 6000,    # circuit evaluations per instance -- the real budget knob
+    "turbo_hours": 1.5,     # wall-clock cap on the search; 0 = unlimited
     "turbo_n_tr": 2,        # independent trust regions per instance
-    "turbo_n_cand": 192,    # Thompson candidates drawn per region per step
+    "turbo_n_cand": 512,    # Thompson candidates drawn per region per step
+    "turbo_batch": 32,      # picks per region per step. Each step costs one GP
+                            # factorisation whatever this is, so raising it buys
+                            # evaluations far more cheaply than more steps do.
+    "turbo_mem": 256,       # observations the local GP keeps per region
+    "turbo_gp_dtype": "float32",   # a T4 runs float64 at 1/32 rate and the GP dominates
     "turbo_polish": 200,    # final Adam steps on TuRBO's best point
-    "turbo_baselines": 8,   # matched-budget control runs (tqa and uniform)
+    "turbo_baselines": 4,   # matched-budget control runs (tqa and uniform)
 
     # ---- mode="rollout" --------------------------------------------------------------
     "train_hours": 6.0,     # wall-clock budget; the real control, not `iters`
@@ -95,8 +102,11 @@ CONFIG = {
 QUICK = {
     "name": "quick",
     "turbo_evals": 60,
+    "turbo_hours": 0.0,
     "turbo_n_tr": 1,
     "turbo_n_cand": 32,
+    "turbo_batch": 4,
+    "turbo_mem": 24,
     "turbo_polish": 20,
     "turbo_baselines": 2,
     "basin_hours": 0.05,
@@ -300,6 +310,8 @@ def main(argv=None):
             "--evals", str(cfg["turbo_evals"]), "--n-tr", str(cfg["turbo_n_tr"]),
             "--max-hours", str(cfg["turbo_hours"]),
             "--n-cand", str(cfg["turbo_n_cand"]), "--polish", str(cfg["turbo_polish"]),
+            "--batch", str(cfg["turbo_batch"]), "--mem", str(cfg["turbo_mem"]),
+            "--gp-dtype", str(cfg["turbo_gp_dtype"]),
             "--baseline-starts", str(cfg["turbo_baselines"]),
             "--seed", str(cfg["seed"]), "--device", args.device,
         ])

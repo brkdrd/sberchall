@@ -100,6 +100,9 @@ def gp_factor(X, y, valid, ls, outscale, noise):
         try:
             L = torch.linalg.cholesky(
                 K + jitter * torch.eye(n, device=K.device, dtype=K.dtype))
+            if jitter >= 1e-4:
+                # at this level the jitter, not the data, is setting the posterior
+                TIMERS["_bad_jitter"] += 1
             break
         except Exception:
             if jitter == 1e-2:
@@ -108,13 +111,20 @@ def gp_factor(X, y, valid, ls, outscale, noise):
     return L, alpha
 
 
-def gp_predict(Xc, X, L, alpha, valid, ls, outscale):
-    """Posterior mean and variance at candidates Xc (b, m, d)."""
-    Ks = outscale.view(-1, 1, 1) * matern52(Xc, X, ls) * valid.unsqueeze(1)
-    mean = (Ks @ alpha).squeeze(-1)
-    v = torch.linalg.solve_triangular(L, Ks.transpose(-1, -2), upper=False)
-    var = outscale.view(-1, 1) - (v * v).sum(dim=-2)
-    return mean, var.clamp_min(1e-10)
+def gp_predict(Xc, X, L, alpha, valid, ls, outscale, chunk=256):
+    """Posterior mean and variance at candidates Xc (b, m, d).
+
+    Chunked over regions: at n_cand=512 and mem=256 the cross-covariance and the
+    triangular solve are half a gigabyte each, and they are transient.
+    """
+    means, vars_ = [], []
+    for i in range(0, Xc.shape[0], chunk):
+        j = slice(i, i + chunk)
+        Ks = outscale[j].view(-1, 1, 1) * matern52(Xc[j], X[j], ls[j]) * valid[j].unsqueeze(1)
+        means.append((Ks @ alpha[j]).squeeze(-1))
+        v = torch.linalg.solve_triangular(L[j], Ks.transpose(-1, -2), upper=False)
+        vars_.append(outscale[j].view(-1, 1) - (v * v).sum(dim=-2))
+    return torch.cat(means), torch.cat(vars_).clamp_min(1e-10)
 
 
 def fit_hypers(X, y, valid, ls, outscale, noise, steps=30, lr=0.08, sub=96, gen=None):
@@ -133,7 +143,7 @@ def fit_hypers(X, y, valid, ls, outscale, noise, steps=30, lr=0.08, sub=96, gen=
     p_os = outscale.log().clone().requires_grad_(True)
     p_no = noise.log().clone().requires_grad_(True)
     opt = torch.optim.Adam([p_ls, p_os, p_no], lr=lr)
-    n_eff = vs.sum(dim=1).clamp_min(1).double()
+    n_eff = vs.sum(dim=1).clamp_min(1).to(X.dtype)
     for _ in range(steps):
         opt.zero_grad()
         lsv = p_ls.exp().clamp(1e-2, 10.0).expand(len(idx), -1)
@@ -171,16 +181,16 @@ class Turbo:
     """N x n_tr trust regions advanced in lockstep."""
 
     def __init__(self, n, d, device, gen, n_tr=2, l_init=0.8, l_min=0.5 ** 7,
-                 l_max=1.6, tau_succ=3, tau_fail=8, mem=128):
+                 l_max=1.6, tau_succ=3, tau_fail=8, mem=128, dtype=torch.float64):
         self.b, self.d, self.n, self.n_tr = n * n_tr, d, n, n_tr
-        self.device, self.gen, self.mem = device, gen, mem
+        self.device, self.gen, self.mem, self.dtype = device, gen, mem, dtype
         self.l_init, self.l_min, self.l_max = l_init, l_min, l_max
         self.tau_succ, self.tau_fail = tau_succ, tau_fail
-        self.L = torch.full((self.b,), l_init, device=device, dtype=torch.float64)
+        self.L = torch.full((self.b,), l_init, device=device, dtype=dtype)
         self.succ = torch.zeros(self.b, device=device)
         self.fail = torch.zeros(self.b, device=device)
-        self.X = torch.zeros(self.b, mem, d, device=device, dtype=torch.float64)
-        self.y = torch.zeros(self.b, mem, device=device, dtype=torch.float64)
+        self.X = torch.zeros(self.b, mem, d, device=device, dtype=dtype)
+        self.y = torch.zeros(self.b, mem, device=device, dtype=dtype)
         self.valid = torch.zeros(self.b, mem, dtype=torch.bool, device=device)
         self.ptr = torch.zeros(self.b, dtype=torch.long, device=device)
         self.restarts = 0
@@ -236,11 +246,11 @@ class Turbo:
         lo = (c - side / 2).clamp(0, 1)
         hi = (c + side / 2).clamp(0, 1)
         r = torch.rand(self.b, n_cand, self.d, device=self.device,
-                       dtype=torch.float64, generator=self.gen)
+                       dtype=self.dtype, generator=self.gen)
         return lo.unsqueeze(1) + r * (hi - lo).unsqueeze(1)
 
 
-def make_objective(sim, h, scale, n_tr, chunk=8192):
+def make_objective(sim, h, scale, n_tr, chunk=8192, dtype=torch.float64):
     """log P(ground), batched over (trust region, instance) and evaluated in chunks."""
     h_rep = h.repeat(n_tr, 1)
     lo, hi = box(h.device)
@@ -258,7 +268,7 @@ def make_objective(sim, h, scale, n_tr, chunk=8192):
                 p = sim.p_ground(hh[s:s + chunk], a[:, :DEPTH], a[:, DEPTH:])
                 out.append(torch.log(p.clamp_min(1e-12)))
         counter["evals"] += u.shape[0]
-        return torch.cat(out).view(b, m).double()
+        return torch.cat(out).view(b, m).to(dtype)
 
     return f, counter, (lo, hi)
 
@@ -266,9 +276,10 @@ def make_objective(sim, h, scale, n_tr, chunk=8192):
 def run(sim, h, scale, args, gen):
     dev = h.device
     n = h.shape[0]
-    f, counter, (lo, hi) = make_objective(sim, h, scale, args.n_tr, args.chunk)
+    dt = torch.float32 if args.gp_dtype == "float32" else torch.float64
+    f, counter, (lo, hi) = make_objective(sim, h, scale, args.n_tr, args.chunk, dt)
     tb = Turbo(n, N_ANGLES, dev, gen, n_tr=args.n_tr, mem=args.mem,
-               tau_fail=args.tau_fail)
+               tau_fail=args.tau_fail, dtype=dt)
 
     def seed(mask=None):
         """Initial design: half Sobol, half annealing-schedule points (see schedules.py).
@@ -285,16 +296,16 @@ def run(sim, h, scale, args, gen):
         # draw the scramble seed on that device rather than implicitly on the CPU.
         sd = int(torch.randint(1 << 30, (1,), device=dev, generator=gen).item())
         sob = torch.quasirandom.SobolEngine(N_ANGLES, scramble=True, seed=sd)
-        xs = sob.draw(k * m).to(dev).double().view(k, m, N_ANGLES)
+        xs = sob.draw(k * m).to(dev).to(dt).view(k, m, N_ANGLES)
         n_sched = m // 2
         u = sample_starts(k * n_sched, "ramp", dev, gen)
-        xs[:, :n_sched] = to_unit(u.double(), lo, hi).view(k, n_sched, N_ANGLES).clamp(0, 1)
+        xs[:, :n_sched] = to_unit(u.to(dt), lo, hi).view(k, n_sched, N_ANGLES).clamp(0, 1)
         tb.add(xs, f(xs, idx), idx)
 
     seed()
-    ls = torch.ones(tb.b, N_ANGLES, device=dev, dtype=torch.float64) * 0.3
-    osc = torch.ones(tb.b, device=dev, dtype=torch.float64)
-    nsc = torch.full((tb.b,), 1e-3, device=dev, dtype=torch.float64)
+    ls = torch.ones(tb.b, N_ANGLES, device=dev, dtype=dt) * 0.3
+    osc = torch.ones(tb.b, device=dev, dtype=dt)
+    nsc = torch.full((tb.b,), 1e-3, device=dev, dtype=dt)
 
     t0, it = time.time(), 0
     budget = args.evals * n
@@ -316,12 +327,17 @@ def run(sim, h, scale, args, gen):
             ystd = standardise(tb.y, tb.valid)
             L, alpha = gp_factor(tb.X, ystd, tb.valid, ls, osc, nsc)
             xc = tb.candidates(ls, args.n_cand)
-            mu, var = gp_predict(xc, tb.X, L, alpha, tb.valid, ls, osc)
-            # Thompson sampling on independent marginals -- the joint draw TuRBO specifies
-            # needs an (n_cand x n_cand) Cholesky per region, which does not batch here
-            draw = mu + var.sqrt() * torch.randn(mu.shape, device=dev, dtype=torch.float64,
-                                                 generator=gen)
-            pick = draw.topk(args.batch, dim=1).indices
+            mu, var = gp_predict(xc, tb.X, L, alpha, tb.valid, ls, osc, args.gp_chunk)
+            # One realisation per batch slot, each contributing its own argmax -- this is
+            # TuRBO's batch rule. Taking the top-q of a SINGLE realisation instead would
+            # return q points clustered around the same peak, which is harmless at q=4 and
+            # wastes most of the batch at q=32.
+            # (Marginals only: the joint draw needs an n_cand x n_cand Cholesky per region,
+            # which does not batch at this size.)
+            sd = var.sqrt().unsqueeze(1)
+            eps = torch.randn(mu.shape[0], args.batch, mu.shape[1], device=dev,
+                              dtype=dt, generator=gen)
+            pick = (mu.unsqueeze(1) + sd * eps).argmax(dim=2)
             xs = torch.gather(xc, 1, pick.unsqueeze(-1).expand(-1, -1, N_ANGLES))
         ys = f(xs)
 
@@ -387,9 +403,15 @@ def main(argv=None):
                          "10-minute inference limit, to see where the method saturates.")
     ap.add_argument("--n-tr", type=int, default=2, help="trust regions per instance")
     ap.add_argument("--n-init", type=int, default=20, help="initial design per region")
-    ap.add_argument("--n-cand", type=int, default=192, help="Thompson candidates per step")
-    ap.add_argument("--batch", type=int, default=4, help="picks per region per step")
-    ap.add_argument("--mem", type=int, default=128, help="GP memory per region")
+    ap.add_argument("--n-cand", type=int, default=512, help="Thompson candidates per step")
+    ap.add_argument("--batch", type=int, default=32,
+                    help="picks per region per step. Each step costs one GP factorisation "
+                         "regardless, so this is the cheapest way to buy evaluations.")
+    ap.add_argument("--gp-dtype", default="float32", choices=("float32", "float64"),
+                    help="float64 is the safe GP default, but a T4 runs it at 1/32 rate "
+                         "and the surrogate dominates this workload")
+    ap.add_argument("--gp-chunk", type=int, default=256, help="regions per posterior chunk")
+    ap.add_argument("--mem", type=int, default=256, help="GP memory per region")
     ap.add_argument("--tau-fail", type=int, default=8)
     ap.add_argument("--hp-every", type=int, default=10)
     ap.add_argument("--hp-steps", type=int, default=25)
@@ -452,12 +474,17 @@ def main(argv=None):
         for e, m, md, t in curve[::step] + [curve[-1]]:
             print(f"   {e:>11} {m:>9.4f} {md:>9.4f} {t:>7.0f}")
 
+    bad = TIMERS.pop("_bad_jitter", 0)
     tot = sum(TIMERS.values()) or 1.0
     print("\nwhere the time went:")
     for k, v in sorted(TIMERS.items(), key=lambda kv: -kv[1]):
         print(f"   {k:>10} {v:7.0f}s  ({v / tot:5.1%})")
     print(f"   {'other':>10} {t_all - tot:7.0f}s")
 
+    if bad:
+        print(f"\nWARNING: {int(bad)} GP solves needed jitter >= 1e-4 to factorise. At that "
+              f"level the jitter is setting the posterior, not the data — if this is large, "
+              f"rerun with --gp-dtype float64.")
     budget = "within" if t_all < 600 else "OVER — diagnostic run, not a submission"
     print(f"\ntotal {t_all:.0f}s — {budget} the 10-minute inference limit")
     print("reference: proposer 0.18405 | multistart nb 03 0.32396 | leaderboard #1 0.81468")
