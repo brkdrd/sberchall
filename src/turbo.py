@@ -172,15 +172,15 @@ class Turbo:
         self.ptr = torch.zeros(self.b, dtype=torch.long, device=device)
         self.restarts = 0
 
-    def add(self, xs, ys):
+    def add(self, xs, ys, idx=None):
         """Append a batch of (candidate, value) into each trust region's ring buffer."""
+        rows = torch.arange(self.b, device=self.device) if idx is None else idx
         for j in range(xs.shape[1]):
-            p = self.ptr % self.mem
-            rows = torch.arange(self.b, device=self.device)
+            p = self.ptr[rows] % self.mem
             self.X[rows, p] = xs[:, j]
             self.y[rows, p] = ys[:, j]
             self.valid[rows, p] = True
-            self.ptr += 1
+            self.ptr[rows] += 1
 
     def best(self):
         yy = torch.where(self.valid, self.y, torch.full_like(self.y, -1e30))
@@ -234,10 +234,10 @@ def make_objective(sim, h, scale, n_tr, chunk=8192):
     counter = {"evals": 0}
 
     @torch.no_grad()
-    def f(x_unit):                                   # (b, m, d) in [0,1] -> (b, m)
+    def f(x_unit, idx=None):                         # (b, m, d) in [0,1] -> (b, m)
         b, m, d = x_unit.shape
         u = from_unit(x_unit.reshape(-1, d).float(), lo, hi)
-        hh = h_rep.repeat_interleave(m, dim=0)
+        hh = (h_rep if idx is None else h_rep[idx]).repeat_interleave(m, dim=0)
         out = []
         for s in range(0, u.shape[0], chunk):
             a = to_angles(u[s:s + chunk], scale)
@@ -257,25 +257,25 @@ def run(sim, h, scale, args, gen):
                tau_fail=args.tau_fail)
 
     def seed(mask=None):
-        """Initial design: half Sobol, half TQA schedules (see schedules.py)."""
-        m = args.n_init
-        sob = torch.quasirandom.SobolEngine(N_ANGLES, scramble=True,
-                                            seed=int(torch.randint(1 << 30, (1,), generator=gen)))
-        xs = sob.draw(tb.b * m).to(dev).double().view(tb.b, m, N_ANGLES)
+        """Initial design: half Sobol, half annealing-schedule points (see schedules.py).
+
+        Only the regions being seeded are evaluated. Seeding all of them on every restart
+        would spend the whole budget re-measuring regions that never restarted.
+        """
+        idx = (torch.arange(tb.b, device=dev) if mask is None
+               else mask.nonzero(as_tuple=True)[0])
+        if idx.numel() == 0:
+            return
+        k, m = idx.numel(), args.n_init
+        # SobolEngine's seed is a plain int; the RNG here lives on the compute device, so
+        # draw the scramble seed on that device rather than implicitly on the CPU.
+        sd = int(torch.randint(1 << 30, (1,), device=dev, generator=gen).item())
+        sob = torch.quasirandom.SobolEngine(N_ANGLES, scramble=True, seed=sd)
+        xs = sob.draw(k * m).to(dev).double().view(k, m, N_ANGLES)
         n_sched = m // 2
-        u = sample_starts(tb.b * n_sched, "ramp", dev, gen)
-        xs[:, :n_sched] = to_unit(u.double(), lo, hi).view(tb.b, n_sched, N_ANGLES).clamp(0, 1)
-        ys = f(xs)
-        if mask is None:
-            tb.add(xs, ys)
-        else:
-            keep = mask.nonzero(as_tuple=True)[0]
-            for j in range(m):
-                p = tb.ptr[keep] % tb.mem
-                tb.X[keep, p] = xs[keep, j]
-                tb.y[keep, p] = ys[keep, j]
-                tb.valid[keep, p] = True
-                tb.ptr[keep] += 1
+        u = sample_starts(k * n_sched, "ramp", dev, gen)
+        xs[:, :n_sched] = to_unit(u.double(), lo, hi).view(k, n_sched, N_ANGLES).clamp(0, 1)
+        tb.add(xs, f(xs, idx), idx)
 
     seed()
     ls = torch.ones(tb.b, N_ANGLES, device=dev, dtype=torch.float64) * 0.3
