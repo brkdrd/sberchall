@@ -138,6 +138,23 @@ and the symmetry canonicaliser), `src/rollout.py` (sim-in-the-loop rollout), `sr
 `src/validate.py`, `src/predict.py`, `src/basins.py` + `src/proposer.py` (learned restarts,
 below), `src/qaoa_ref.py` (differentiable simulator — the organisers' file, unmodified).
 
+## Trust-region Bayesian optimisation (`src/turbo.py`)
+
+TuRBO (Eriksson et al., NeurIPS 2019) fits a *local* GP inside a trust region around the
+best point found, picks candidates by Thompson sampling, and grows or shrinks that region
+on streaks of success or failure — restarting it elsewhere when it collapses. A single
+global GP over-smooths a landscape this rugged and ends up sampling its own mean.
+
+The implementation runs `N x n_tr` trust regions batched on the GPU, and adds four things
+to stock TuRBO that are specific to this problem: the initial design is seeded from the
+annealing-schedule family rather than pure Sobol; the box covers exactly one `beta` period
+so the search is not re-exploring 32 copies of every optimum; the objective is `log
+P(ground)`, which spans four orders of magnitude; and the final point gets an Adam polish,
+since refusing to use exact gradients we already have would be an affectation. Matched-budget
+`tqa` and `uniform` controls run alongside, because a score without them is uninterpretable.
+
+No training stage — `python -m src` with `mode="turbo"` is a single pass over `h`.
+
 ## Learned restarts (`src/basins.py`, `src/proposer.py`)
 
 A second mode, and the one `CONFIG["mode"]` selects by default. The premise is that Adam

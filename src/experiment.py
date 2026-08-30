@@ -33,6 +33,7 @@ import torch
 from . import basins as basins_mod
 from . import proposer as proposer_mod
 from . import train as train_mod
+from . import turbo as turbo_mod
 from . import validate as validate_mod
 from .angles import angle_scale, energy_span, to_angles
 from .predict import write_submission
@@ -45,7 +46,8 @@ REPO = Path(__file__).resolve().parents[1]
 # --------------------------------------------------------------------------------------
 CONFIG = {
     "name": "proposer",     # names the run directory when not on Kaggle
-    "mode": "proposer",     # "proposer" = learned restarts; "rollout" = learned optimiser
+    "mode": "turbo",        # "turbo" = trust-region BO (no training stage at all);
+                            # "proposer" = learned restarts; "rollout" = learned optimiser
     "seed": 0,
 
     # ---- mode="proposer" -------------------------------------------------------------
@@ -66,6 +68,14 @@ CONFIG = {
     # stage 3: inference — propose K, Adam from each, select after polishing
     "infer_polish": 300,
 
+    # ---- mode="turbo" ----------------------------------------------------------------
+    # Pure inference-time search: nothing is trained, so a run is one pass over h.
+    "turbo_evals": 400,     # circuit evaluations per instance -- the real budget knob
+    "turbo_n_tr": 2,        # independent trust regions per instance
+    "turbo_n_cand": 192,    # Thompson candidates drawn per region per step
+    "turbo_polish": 200,    # final Adam steps on TuRBO's best point
+    "turbo_baselines": 8,   # matched-budget control runs (tqa and uniform)
+
     # ---- mode="rollout" --------------------------------------------------------------
     "train_hours": 6.0,     # wall-clock budget; the real control, not `iters`
     "iters": 12000,         # upper bound — the clock usually binds first
@@ -82,6 +92,11 @@ CONFIG = {
 # Applied on top of CONFIG by `--quick`: exercises every stage in a few minutes.
 QUICK = {
     "name": "quick",
+    "turbo_evals": 60,
+    "turbo_n_tr": 1,
+    "turbo_n_cand": 32,
+    "turbo_polish": 20,
+    "turbo_baselines": 2,
     "basin_hours": 0.05,
     "basin_instances": 32,
     "basin_starts": 16,
@@ -276,7 +291,18 @@ def main(argv=None):
     submission = out_dir / "submission_train.csv"
     extra = {}
 
-    if cfg["mode"] == "proposer":
+    if cfg["mode"] == "turbo":
+        stage("turbo")
+        va = turbo_mod.main([
+            "--data-dir", str(args.data_dir), "--out", str(submission),
+            "--evals", str(cfg["turbo_evals"]), "--n-tr", str(cfg["turbo_n_tr"]),
+            "--n-cand", str(cfg["turbo_n_cand"]), "--polish", str(cfg["turbo_polish"]),
+            "--baseline-starts", str(cfg["turbo_baselines"]),
+            "--seed", str(cfg["seed"]), "--device", args.device,
+        ])
+        tr = {"note": "turbo has no training stage"}
+        extra["turbo_no_polish"] = va["mean_p_no_polish"]
+    elif cfg["mode"] == "proposer":
         npz = out_dir / "basins.npz"
         if npz.exists():
             print(f"\n[basins] reusing {npz} — delete it to regenerate", flush=True)

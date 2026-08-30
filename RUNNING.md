@@ -248,6 +248,28 @@ python -m src --set train_hours=1 --set val_restarts=64
 
 The notebook passes no arguments, by design.
 
+### `mode = "turbo"` — trust-region Bayesian optimisation
+
+The default. **Nothing is trained**, so a run is a single pass over `h`: no basin stage, no
+model, no checkpoint. `src/turbo.py` advances `500 x turbo_n_tr` independent TuRBO searches
+in lockstep — one batched Cholesky per step rather than a Python loop over instances, the
+same vectorisation notebook 04 used for CMA-ES.
+
+`turbo_evals` (circuit evaluations per instance) is the only real knob; everything else
+trades where those evaluations go. The run reports four numbers, and only the comparison
+matters:
+
+| line | what it is |
+|---|---|
+| `TuRBO alone` | the search with no gradient help at all |
+| `TuRBO + N Adam steps` | the hybrid — BO picks the basin, Adam descends it |
+| `tqa xK + Adam` | matched-budget control from the annealing schedule |
+| `uniform xK + Adam` | matched-budget control from the old 10-D box |
+
+If the hybrid does not beat both controls, TuRBO is not earning its complexity. Reading
+`TuRBO alone` against the hybrid tells you how much of the result is the search versus the
+gradient.
+
 `CONFIG["mode"]` picks which pipeline runs. `"proposer"` (the default) is the learned-restart
 experiment: **basins** (label which random starts flow to the optimum — the expensive stage,
 bounded by `basin_hours`) -> **proposer** (train `h -> K starts`) -> **validate** (propose K,
