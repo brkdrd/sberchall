@@ -78,8 +78,13 @@ CONFIG = {
     # ---- mode="lbfgs" ----------------------------------------------------------------
     # Batched L-BFGS with asynchronous restarts. Exact gradients, a real convergence
     # test, and a matched-budget Adam control in the same pass.
-    "lbfgs_budget": 20000,    # forward passes per instance (value=1, value+grad=2)
-    "lbfgs_hours": 1.0,       # wall-clock cap; the best point so far is kept
+    # For a SEARCH mode there is no trained model, so the search *is* the inference step:
+    # the competition's 600 s limit (README.md:60) binds on this run directly, unlike the
+    # trained modes where searching happens offline. The cap is therefore set under that
+    # limit and is meant to bind before `lbfgs_budget` does. Raising it past ~0.16 makes
+    # the run a diagnostic whose submission is not legal for the stage.
+    "lbfgs_budget": 200000,   # forward passes per instance (value=1, value+grad=2)
+    "lbfgs_hours": 0.15,      # 540 s -- under the 600 s limit, with headroom
     "lbfgs_memory": 10,       # curvature pairs
     "lbfgs_max_iters": 200,   # cap on iterations within one restart
     "lbfgs_init": "ramp",     # start family (see schedules.py)
