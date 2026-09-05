@@ -32,6 +32,7 @@ import torch
 
 from . import anytime as anytime_mod
 from . import basins as basins_mod
+from . import lbfgs as lbfgs_mod
 from . import proposer as proposer_mod
 from . import train as train_mod
 from . import turbo as turbo_mod
@@ -49,7 +50,8 @@ CONFIG = {
     "name": "proposer",     # names the run directory when not on Kaggle
     # NOTE: adding a new mode must never change this line. Doing so silently runs a
     # different experiment than the one the last change was made for.
-    "mode": "turbo",        # "turbo" = trust-region BO (no training stage at all);
+    "mode": "lbfgs",        # "lbfgs" = batched quasi-Newton search (no training stage);
+                            # "turbo" = trust-region BO (no training stage at all);
                             # "anytime" = per-instance budget/quality profiling (an
                             # analysis run -- writes no submission);
                             # "proposer" = learned restarts; "rollout" = learned optimiser
@@ -72,6 +74,16 @@ CONFIG = {
     "prop_eval_every": 1000,
     # stage 3: inference — propose K, Adam from each, select after polishing
     "infer_polish": 300,
+
+    # ---- mode="lbfgs" ----------------------------------------------------------------
+    # Batched L-BFGS with asynchronous restarts. Exact gradients, a real convergence
+    # test, and a matched-budget Adam control in the same pass.
+    "lbfgs_budget": 20000,    # forward passes per instance (value=1, value+grad=2)
+    "lbfgs_hours": 1.0,       # wall-clock cap; the best point so far is kept
+    "lbfgs_memory": 10,       # curvature pairs
+    "lbfgs_max_iters": 200,   # cap on iterations within one restart
+    "lbfgs_init": "ramp",     # start family (see schedules.py)
+    "lbfgs_control": True,    # also run Adam at the identical forward-pass budget
 
     # ---- mode="anytime" --------------------------------------------------------------
     # Answers "how much budget does an instance need, and when do we stop paying?"
@@ -116,6 +128,8 @@ CONFIG = {
 # Applied on top of CONFIG by `--quick`: exercises every stage in a few minutes.
 QUICK = {
     "name": "quick",
+    "lbfgs_budget": 600,
+    "lbfgs_hours": 0.05,
     "anytime_extra": 24,
     "anytime_restarts": 2,
     "anytime_steps": 40,
@@ -322,6 +336,29 @@ def main(argv=None):
     scale_info = preflight(args.data_dir, args.device)
     submission = out_dir / "submission_train.csv"
     extra = {}
+
+    if cfg["mode"] == "lbfgs":
+        stage("lbfgs")
+        va = lbfgs_mod.main([
+            "--data-dir", str(args.data_dir), "--out", str(submission),
+            "--budget", str(cfg["lbfgs_budget"]), "--max-hours", str(cfg["lbfgs_hours"]),
+            "--memory", str(cfg["lbfgs_memory"]),
+            "--max-iters", str(cfg["lbfgs_max_iters"]), "--init", str(cfg["lbfgs_init"]),
+            "--seed", str(cfg["seed"]), "--device", args.device,
+        ] + ([] if cfg["lbfgs_control"] else ["--skip-control"]))
+        tr = {"note": "lbfgs has no training stage"}
+        stage("summary")
+        sm = summarise(submission, args.data_dir, args.device)
+        summary = {"commit": git_sha(), "config": cfg, "scale": scale_info,
+                   "lbfgs": {k: (str(v) if isinstance(v, Path) else v)
+                             for k, v in va.items()},
+                   "submission": sm, "total_seconds": time.time() - t0}
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+        print(f"\ntotal {(time.time() - t0) / 60:.1f} min. artefacts in {out_dir}:")
+        for f in sorted(out_dir.iterdir()):
+            if f.is_file():
+                print(f"  {f.name:<24} {f.stat().st_size / 1024:8.0f} KiB")
+        return summary
 
     if cfg["mode"] == "anytime":
         stage("anytime")
