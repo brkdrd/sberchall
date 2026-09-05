@@ -175,6 +175,11 @@ def search(sim, h, scale, args, gen):
     x = sample_starts(n, args.init, dev, gen)
     f, g = f_and_g(sim, h, x, scale, bud, chunk)
     best_f, best_x = f.clone(), x.clone()
+    # fwd/instance at which each instance last improved: the basis for "has it saturated?"
+    last_imp = torch.zeros(n, device=dev)
+    # the answer as it stood when the competition's inference limit elapsed, kept so the
+    # asymptote and the legal result come out of one run instead of two
+    legal = {}
     iters = torch.zeros(n, device=dev)
     restarts = torch.zeros(n, device=dev)
     conv_iters, ls_evals, ls_calls = [], 0, 0
@@ -218,6 +223,11 @@ def search(sim, h, scale, args, gen):
         better = f_new < best_f
         best_f = torch.where(better, f_new, best_f)
         best_x = torch.where(better.unsqueeze(-1), x_new, best_x)
+        last_imp = torch.where(better, torch.full_like(last_imp, bud.per_instance()),
+                               last_imp)
+        if not legal and time.time() - t0 >= args.legal_seconds:
+            legal = {"x": best_x.clone(), "p": (-best_f).exp().clone(),
+                     "fwd": bud.per_instance(), "sec": time.time() - t0}
 
         # converged: flat gradient, a line search that found no acceptable step, or a cap
         flat = g.abs().amax(-1) < args.gtol
@@ -246,7 +256,9 @@ def search(sim, h, scale, args, gen):
                   f"median {p.median():.4f}  restarts/inst {restarts.mean():5.1f}  "
                   f"{time.time() - t0:6.0f}s", flush=True)
 
+    stale = bud.per_instance() - last_imp
     stats = {"restarts_mean": restarts.mean().item(),
+             "stale": stale.cpu(), "legal": legal, "seconds": time.time() - t0,
              "conv_gtol": int(why["gtol"]), "conv_ls_fail": int(why["ls"]),
              "conv_cap": int(why["cap"]),
              "iters_to_converge": float(np.mean(conv_iters)) if conv_iters else float("nan"),
@@ -254,12 +266,16 @@ def search(sim, h, scale, args, gen):
     return best_x, (-best_f).exp(), bud, curve, stats
 
 
-def adam_matched(sim, h, scale, args, gen, target_fwd):
+def adam_matched(sim, h, scale, args, gen, target_fwd, deadline=None):
     """Adam multistart held to the same forward-pass budget, as the control."""
     dev, n = h.device, h.shape[0]
     bud = Budget(n)
     best = torch.zeros(n, device=dev)
+    t0 = time.time()
     while bud.fwd < target_fwd:
+        if deadline and time.time() - t0 > deadline:
+            print(f"  (control stopped early at {bud.per_instance()} fwd/inst)", flush=True)
+            break
         u = sample_starts(n, args.init, dev, gen).clone().requires_grad_(True)
         opt = torch.optim.Adam([u], lr=args.adam_lr)
         for _ in range(args.adam_steps):
@@ -293,6 +309,12 @@ def main(argv=None):
     ap.add_argument("--adam-lr", type=float, default=0.03)
     ap.add_argument("--adam-steps", type=int, default=300)
     ap.add_argument("--skip-control", action="store_true")
+    ap.add_argument("--control-hours", type=float, default=0.0,
+                    help="wall-clock cap on the Adam control; 0 = only the budget binds")
+    ap.add_argument("--legal-seconds", type=float, default=600.0,
+                    help="snapshot the best answer as this elapses -- the competition's "
+                         "inference limit, so a long run yields both the asymptote and a "
+                         "submittable result")
     ap.add_argument("--log-every", type=int, default=1000, help="fwd/instance between logs")
     ap.add_argument("--chunk", type=int, default=4096)
     ap.add_argument("--seed", type=int, default=0)
@@ -323,7 +345,8 @@ def main(argv=None):
           f"line-search failure {st['conv_ls_fail']}, iteration cap {st['conv_cap']}")
 
     if not args.skip_control:
-        pa, ba = adam_matched(sim, h, scale, args, gen, bud.fwd)
+        pa, ba = adam_matched(sim, h, scale, args, gen, bud.fwd,
+                              deadline=args.control_hours * 3600 or None)
         print(f"Adam, same budget: mean P {pa.mean():.5f}  median {pa.median():.5f}  "
               f"({ba.per_instance()} fwd/inst)")
         print(f"  -> L-BFGS is {p.mean().item() / max(pa.mean().item(), 1e-12):.3f}x Adam "
@@ -340,14 +363,56 @@ def main(argv=None):
         for e, m, md, t in curve[::max(1, len(curve) // 12)] + [curve[-1]]:
             print(f"   {e:>9} {m:>9.4f} {md:>9.4f} {t:>7.0f}")
 
-    print(f"\ntotal {secs:.0f}s — {'within' if secs < 600 else 'OVER'} the 10-minute limit")
+    # --- what does the cap actually cost? ---------------------------------------------
+    legal = st.pop("legal", {})
+    out = {}
+    if legal:
+        lp = legal["p"]
+        keep = lp.mean().item() / max(p.mean().item(), 1e-12)
+        print(f"\nTHE CAP — best answer as the {args.legal_seconds:.0f}s inference limit "
+              f"elapsed, against the unconstrained result")
+        print(f"  at {legal['sec']:.0f}s ({legal['fwd']} fwd/inst): mean P {lp.mean():.5f}")
+        print(f"  at {secs:.0f}s ({bud.per_instance()} fwd/inst): mean P {p.mean():.5f}")
+        print(f"  -> the legal budget captures {keep:.1%} of what the full run "
+              f"reaches in {secs:.0f}s; the remaining {1 - keep:.1%} is "
+              f"unreachable within the rules")
+        legal_out = args.out.with_name(args.out.stem + "_legal.csv")
+        write_submission(legal_out, to_angles(legal["x"], scale))
+        out["submission_legal"] = str(legal_out)
+        out["mean_p_legal"] = lp.mean().item()
+        out["legal_fwd_per_instance"] = legal["fwd"]
+
+    # --- has it saturated, and is the remaining gain concentrated in a few instances? ---
+    stale = st.pop("stale")
+    tot = bud.per_instance()
+    print("\nSATURATION — share of instances whose best has not moved in the last ...")
+    for frac in (0.05, 0.1, 0.25, 0.5):
+        w = int(tot * frac)
+        print(f"  {w:>7} fwd/inst ({frac:.0%} of the run): "
+              f"{(stale >= w).float().mean().item():>6.1%} idle")
+    print(f"  median staleness {stale.median().item():.0f} fwd/inst of {tot}")
+
+    if curve:
+        print("\nWALL CLOCK vs QUALITY — is another doubling of time worth buying?")
+        print(f"   {'sec':>7} {'fwd/inst':>9} {'mean P':>9} {'median':>9} {'gain':>8}")
+        marks, prev, nxt = [], None, 15.0
+        for e, m, md, t in curve:
+            if t >= nxt or (e, m, md, t) == curve[-1]:
+                marks.append((e, m, md, t)); nxt = max(t * 2, t + 30)
+        for e, m, md, t in marks:
+            g = "" if prev is None else f"{m - prev:+.4f}"
+            print(f"   {t:>7.0f} {e:>9} {m:>9.4f} {md:>9.4f} {g:>8}")
+            prev = m
+
+    print(f"\ntotal {secs:.0f}s — {'within' if secs < 600 else 'OVER'} the 10-minute limit"
+          + ("" if secs < 600 else " (diagnostic; the _legal submission is the submittable one)"))
     print("reference: proposer 0.18405 | multistart nb 03 0.32396 | leaderboard #1 0.81468")
     write_submission(args.out, to_angles(u, scale))
     return {"submission": args.out, "mean_p": p.mean().item(),
             "median_p": p.median().item(), "max_p": p.max().item(),
             "seconds": secs, "fwd_per_instance": bud.per_instance(),
             "quantiles": dict(zip([f"p{l}" for l in lv], qq.tolist())),
-            "curve": curve, **st}
+            "curve": curve, **out, **st}
 
 
 if __name__ == "__main__":

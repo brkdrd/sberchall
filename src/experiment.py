@@ -78,13 +78,15 @@ CONFIG = {
     # ---- mode="lbfgs" ----------------------------------------------------------------
     # Batched L-BFGS with asynchronous restarts. Exact gradients, a real convergence
     # test, and a matched-budget Adam control in the same pass.
-    # For a SEARCH mode there is no trained model, so the search *is* the inference step:
-    # the competition's 600 s limit (README.md:60) binds on this run directly, unlike the
-    # trained modes where searching happens offline. The cap is therefore set under that
-    # limit and is meant to bind before `lbfgs_budget` does. Raising it past ~0.16 makes
-    # the run a diagnostic whose submission is not legal for the stage.
-    "lbfgs_budget": 200000,   # forward passes per instance (value=1, value+grad=2)
-    "lbfgs_hours": 0.15,      # 540 s -- under the 600 s limit, with headroom
+    # Currently a LIMIT-FINDING run: it deliberately runs far past the competition's 600 s
+    # inference limit to locate the method's asymptote. It still answers the legal
+    # question, because the best point as 600 s elapses is snapshotted and written as
+    # submission_train_legal.csv — so one run gives both the ceiling and a submittable
+    # result, plus the fraction of the ceiling the cap actually costs.
+    "lbfgs_budget": 2000000,  # forward passes per instance; the clock binds, not this
+    "lbfgs_hours": 2.0,       # search cap
+    "lbfgs_control_hours": 1.0,   # separate cap on the Adam control, so a long search
+                                  # cannot double into a session timeout
     "lbfgs_memory": 10,       # curvature pairs
     "lbfgs_max_iters": 200,   # cap on iterations within one restart
     "lbfgs_init": "ramp",     # start family (see schedules.py)
@@ -349,6 +351,7 @@ def main(argv=None):
             "--budget", str(cfg["lbfgs_budget"]), "--max-hours", str(cfg["lbfgs_hours"]),
             "--memory", str(cfg["lbfgs_memory"]),
             "--max-iters", str(cfg["lbfgs_max_iters"]), "--init", str(cfg["lbfgs_init"]),
+            "--control-hours", str(cfg["lbfgs_control_hours"]),
             "--seed", str(cfg["seed"]), "--device", args.device,
         ] + ([] if cfg["lbfgs_control"] else ["--skip-control"]))
         tr = {"note": "lbfgs has no training stage"}
