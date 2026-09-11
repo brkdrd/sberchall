@@ -32,6 +32,7 @@ import torch
 
 from . import anytime as anytime_mod
 from . import basins as basins_mod
+from . import gscan as gscan_mod
 from . import lbfgs as lbfgs_mod
 from . import proposer as proposer_mod
 from . import train as train_mod
@@ -50,12 +51,29 @@ CONFIG = {
     "name": "proposer",     # names the run directory when not on Kaggle
     # NOTE: adding a new mode must never change this line. Doing so silently runs a
     # different experiment than the one the last change was made for.
-    "mode": "lbfgs",        # "lbfgs" = batched quasi-Newton search (no training stage);
+    "mode": "gscan",        # "gscan" = gamma-box sweep (diagnostic, no submission);
+                            # "lbfgs" = batched quasi-Newton search (no training stage);
                             # "turbo" = trust-region BO (no training stage at all);
                             # "anytime" = per-instance budget/quality profiling (an
                             # analysis run -- writes no submission);
                             # "proposer" = learned restarts; "rollout" = learned optimiser
     "seed": 0,
+
+    # ---- mode="gscan" ----------------------------------------------------------------
+    # Sweeps the gamma sampling half-width over a geometric ladder in raw radians. Tests
+    # whether `angles.py`'s box (|gamma| <= 0.64 rad) excludes the region the metric
+    # needs: resolving E1-E0 ~ 0.17 asks for gamma ~ pi/0.17 ~ 18. Writes gscan.npz and
+    # no submission -- it is an analysis run.
+    "gscan_instances": 16,
+    "gscan_starts": 16384,   # points screened per rung, per instance
+    "gscan_top": 64,         # screened points refined per rung, per instance
+    "gscan_steps": 400,      # Adam steps per refined point
+    "gscan_deep": 4000,      # extra steps on the winning point of the winning rung
+    "gscan_scales": "",      # "" = the default ladder in gscan.LADDER
+    "gscan_chunk": 2048,     # rows refined at once (VRAM knob)
+    "gscan_full": True,      # after the ladder, search all 500 at the winning rung and
+                             # write submission_train.csv (the leaderboard scores h_train)
+    "gscan_full_block": 50,  # instances searched per block in the full pass
 
     # ---- mode="proposer" -------------------------------------------------------------
     # stage 1: label which random starts flow to the optimum (the expensive stage)
@@ -135,6 +153,13 @@ CONFIG = {
 # Applied on top of CONFIG by `--quick`: exercises every stage in a few minutes.
 QUICK = {
     "name": "quick",
+    "gscan_instances": 2,
+    "gscan_starts": 256,
+    "gscan_top": 4,
+    "gscan_steps": 20,
+    "gscan_deep": 20,
+    "gscan_chunk": 64,
+    "gscan_full": False,
     "lbfgs_budget": 600,
     "lbfgs_hours": 0.05,
     "anytime_extra": 24,
@@ -343,6 +368,24 @@ def main(argv=None):
     scale_info = preflight(args.data_dir, args.device)
     submission = out_dir / "submission_train.csv"
     extra = {}
+
+    if cfg["mode"] == "gscan":
+        stage("gscan")
+        va = gscan_mod.main([
+            "--data-dir", str(args.data_dir), "--out", str(out_dir / "gscan.npz"),
+            "--instances", str(cfg["gscan_instances"]),
+            "--starts", str(cfg["gscan_starts"]), "--top", str(cfg["gscan_top"]),
+            "--steps", str(cfg["gscan_steps"]), "--deep", str(cfg["gscan_deep"]),
+            "--chunk", str(cfg["gscan_chunk"]),
+            "--seed", str(cfg["seed"]), "--device", args.device,
+        ] + (["--scales", str(cfg["gscan_scales"])] if cfg["gscan_scales"] else [])
+          + (["--full", "--full-block", str(cfg["gscan_full_block"])]
+             if cfg["gscan_full"] else []))
+        summary = {"commit": git_sha(), "config": cfg, "scale": scale_info,
+                   "gscan": va, "total_seconds": time.time() - t0}
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+        print(f"\ntotal {(time.time() - t0) / 60:.1f} min. artefacts in {out_dir}")
+        return summary
 
     if cfg["mode"] == "lbfgs":
         stage("lbfgs")
