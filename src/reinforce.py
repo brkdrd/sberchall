@@ -169,6 +169,15 @@ def train(args, root, policy, sim, h_eval, cfg, device, out_dir):
     opt = torch.optim.Adam(list(root.parameters()) + list(policy.parameters()), lr=args.lr)
     best, history, t0 = -1.0, [], time.time()
 
+    # written before the first iteration: until the first evaluation there is otherwise
+    # nothing in the mounted directory, and an empty ./runs looks exactly like a failure
+    (out_dir / "run.json").write_text(json.dumps(
+        {"started": time.strftime("%Y-%m-%d %H:%M:%S"), "device": device,
+         "args": vars(args), "chain": asdict(cfg),
+         "evals_per_chain": cfg.evals_per_chain(),
+         "evals_per_iteration": args.batch * args.chains * cfg.evals_per_chain()},
+        indent=2, default=str))
+
     print(f"chain: {1 + 3 * cfg.iters} nodes x {cfg.k} probes x "
           f"(1 + 2*{cfg.adam_steps}) = {cfg.evals_per_chain()} forward passes")
     print(f"iteration: {args.batch} instances x {args.chains} chains = "
@@ -208,6 +217,7 @@ def train(args, root, policy, sim, h_eval, cfg, device, out_dir):
                   f"{ev.get('control_p', float('nan')):.5f} | "
                   f"{ev['evals_per_instance']} evals/instance | {ev['seconds']:.0f}s")
             history.append({"iter": it, **ev})
+            (out_dir / "history.json").write_text(json.dumps(history, indent=2))
             if ev["mean_p"] > best:
                 best = ev["mean_p"]
                 torch.save({"root": root.state_dict(), "policy": policy.state_dict(),

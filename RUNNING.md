@@ -333,9 +333,14 @@ Full architecture in `README.md`; this is the operational side.
 docker compose build                          # one image, all services
 docker compose run --rm reinforce-smoke-cpu   # ~1 min, no GPU required
 docker compose run --rm reinforce-smoke       # ~1 min, proves CUDA too
-docker compose up -d reinforce                # the real run
-docker compose logs -f reinforce
+docker compose up -d reinforce                # the real run, detached
+docker compose logs -f reinforce              # -d prints nothing; this is where it goes
+docker compose ps                             # and this says whether it is still up
 ```
+
+`-d` detaches by design, so the `up` command itself is silent. `logs -f` is the live
+feed and `./runs/reinforce/run.json` is written before the first iteration, so an empty
+directory means the container never got going rather than that it is quiet.
 
 **Before anything else, check the host can do GPU containers.** `deploy.resources` asks
 for the `nvidia` driver, and if the daemon has no such runtime the container fails at

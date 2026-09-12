@@ -17,6 +17,12 @@ FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
 
 WORKDIR /app
 
+# Detached containers pipe stdout, and python block-buffers a pipe in 8 KiB chunks — at
+# ~80 bytes a progress line that is a hundred lines, i.e. hours, before `docker compose
+# logs` shows anything at all. A training run that prints nothing for hours is
+# indistinguishable from one that has hung.
+ENV PYTHONUNBUFFERED=1
+
 # Nothing is pip-installed here, and each omission is deliberate.
 #
 # torch and numpy are already in the base image. Installing torch over it could pull a CPU
