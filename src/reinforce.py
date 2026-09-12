@@ -50,6 +50,38 @@ from .qaoa_ref import QAOA
 H_DIM = 12
 
 
+
+def device_banner(device):
+    """Say what we are running on, and prove a kernel actually launches there.
+
+    `torch.cuda.is_available()` is not the check that matters. A torch built for one CUDA
+    version on a GPU whose architecture it has no cubin for reports the device happily and
+    then fails on the first real kernel — "no kernel image is available for execution on
+    the device" — which on an RTX 5090 (sm_120) is what every image older than CUDA 12.8
+    does. A 8x8 matmul costs nothing and turns that into a message at second one.
+    """
+    print(f"torch {torch.__version__} | cuda {torch.version.cuda} | device {device}")
+    if str(device).startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise SystemExit("--device cuda but torch.cuda.is_available() is False: the "
+                             "container has no GPU. Check `docker info` lists an nvidia "
+                             "runtime, and that the service kept its deploy.resources "
+                             "block (the -cpu services do not have one).")
+        name = torch.cuda.get_device_name(0)
+        cap = ".".join(str(x) for x in torch.cuda.get_device_capability(0))
+        print(f"gpu   {name} (sm_{cap.replace('.', '')}), "
+              f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.0f} GB")
+        try:
+            (torch.zeros(8, 8, device=device) @ torch.zeros(8, 8, device=device)).sum().item()
+        except RuntimeError as e:
+            raise SystemExit(
+                f"a trivial matmul failed on {name}: {e}\n"
+                f"This torch ({torch.__version__}, cuda {torch.version.cuda}) has no "
+                f"kernels for sm_{cap.replace('.', '')}. Rebuild on a base image whose "
+                f"CUDA version covers this GPU — sm_120 (RTX 50xx) needs CUDA >= 12.8, "
+                f"and the driver's own ceiling is the 'CUDA Version' field in nvidia-smi.")
+
+
 def synth(batch, device, gen):
     """Fresh instances. h_train is i.i.d. U(-1, 1), so training data is free and the
     official 500 stay held out."""
@@ -241,6 +273,7 @@ def main(argv=None):
 
     dev = args.device
     torch.manual_seed(args.seed)
+    device_banner(dev)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     sim = QAOA(np.load(args.data_dir / "J.npy"), device=dev)
     cfg = chain_config(args)

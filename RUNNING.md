@@ -343,8 +343,21 @@ start instead of falling back:
 
 ```bash
 docker info --format '{{json .Runtimes}}'   # must mention nvidia
-nvidia-smi                                  # must print a driver version
+nvidia-smi                                  # driver version, and the CUDA ceiling
 ```
+
+**The CUDA band is one version wide on this hardware, so read both ends.** `nvidia-smi`'s
+"CUDA Version" field is not what is installed — it is the newest CUDA runtime the driver
+can host. Driver 572.16 reports 12.8, so CUDA 13.x images cannot run, whatever torch says.
+At the other end the RTX 5090 is sm_120, for which NVIDIA first ships kernels in CUDA
+12.8, so the 12.6 images fail with "no kernel image is available for execution on the
+device". Floor and ceiling meet at 12.8, which is why the Dockerfile pins
+`pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime` — the newest such image, since 2.12+
+offers only 12.6, 13.0 and 13.2. A Windows driver past 580 is what reopens 13.x.
+
+`python -m src.reinforce` prints torch, CUDA and the GPU on startup and launches a
+throwaway matmul, so a mismatch reports itself in the first second instead of surviving
+until the first real kernel.
 
 Neither is true of the WSL2 development box (no `libcuda.so` under /usr/lib/wsl/lib, no
 /dev/nvidia*), which is why training belongs on the GPU machine and why the -cpu services
