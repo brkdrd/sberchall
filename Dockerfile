@@ -17,11 +17,22 @@ FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
 
 WORKDIR /app
 
-# The base image already carries the CUDA build of torch, so torch is deliberately NOT
-# installed here — a pip install of it could pull a CPU wheel over the top and the failure
-# would only show up as `torch.cuda.is_available()` going False at run time. Everything
-# else in requirements.txt is small and keeps the image honest about what the code imports.
-RUN pip install --no-cache-dir "numpy>=1.24" "scipy>=1.10" "matplotlib>=3.7"
+# Nothing is pip-installed here, and each omission is deliberate.
+#
+# torch and numpy are already in the base image. Installing torch over it could pull a CPU
+# wheel, whose only symptom is `torch.cuda.is_available()` going False at run time; and
+# this image's python is marked externally managed (PEP 668), so a plain `pip install`
+# fails the build outright.
+#
+# Of the rest of requirements.txt: scipy is imported by two notebooks and by nothing under
+# src/, so it has no business in an image that only runs src/. matplotlib is used in one
+# place — the plot at the end of mode="anytime" — inside a try/except that prints
+# "(no plot: ...)" and carries on, so its absence costs a png in a mode this image is not
+# built to run. Install it in the container if you want that png.
+#
+# What the code cannot do without is asserted instead, so a future base image that drops
+# either one fails here rather than three layers later:
+RUN python -c "import numpy, torch; print('numpy', numpy.__version__, '| torch', torch.__version__, '| cuda', torch.version.cuda)"
 
 COPY src/ src/
 # Copied so the image runs standalone (docker run, no compose). docker-compose.yml also
