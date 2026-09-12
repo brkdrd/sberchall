@@ -281,7 +281,9 @@ Training the node-chain policy is a GPU-box job, and this is how it is run.
 ```bash
 docker compose build                        # once, and after any change to src/
 
-# ~1 minute at toy size: proves the image, the mounts and the GPU before an 8h run
+# ~1 minute at toy size, before committing to an 8h run.
+# -cpu proves the image, the mounts and the code; the GPU one proves CUDA as well.
+docker compose run --rm reinforce-smoke-cpu
 docker compose run --rm reinforce-smoke
 
 # the real training run, detached; checkpoints and history land in ./runs/reinforce
@@ -304,7 +306,13 @@ docker compose run --rm gscan
 ```
 
 `./data` and `./runs` are bind-mounted, so `h_test.npy` is usable the day it lands with no
-rebuild, and checkpoints survive the container.
+rebuild, and checkpoints survive the container. Every service is the same image
+(`sberchall:latest`) with a different command, so the build happens once rather than once
+per service.
+
+A GPU service whose host has no `nvidia` container runtime fails at container start rather
+than falling back to CPU — that is Docker's behaviour, not a bug here. On such a machine
+`reinforce-smoke-cpu` and `train-cpu` are the ones that run.
 
 The previous solution stays runnable:
 

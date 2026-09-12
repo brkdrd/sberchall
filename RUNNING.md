@@ -330,11 +330,27 @@ The current main line. It does not run on Kaggle — it is a Docker job on a GPU
 Full architecture in `README.md`; this is the operational side.
 
 ```bash
-docker compose build
-docker compose run --rm reinforce-smoke     # ~1 min, proves image + mounts + GPU
-docker compose up -d reinforce              # the real run
+docker compose build                          # one image, all services
+docker compose run --rm reinforce-smoke-cpu   # ~1 min, no GPU required
+docker compose run --rm reinforce-smoke       # ~1 min, proves CUDA too
+docker compose up -d reinforce                # the real run
 docker compose logs -f reinforce
 ```
+
+**Before anything else, check the host can do GPU containers.** `deploy.resources` asks
+for the `nvidia` driver, and if the daemon has no such runtime the container fails at
+start instead of falling back:
+
+```bash
+docker info --format '{{json .Runtimes}}'   # must mention nvidia
+nvidia-smi                                  # must print a driver version
+```
+
+Neither is true of the WSL2 development box (no `libcuda.so` under /usr/lib/wsl/lib, no
+/dev/nvidia*), which is why training belongs on the GPU machine and why the -cpu services
+exist. A `docker compose build` that ends in `failed to connect to the docker API at
+npipe:////./pipe/dockerDesktopLinuxEngine` is Docker Desktop not running — the compose
+file parsed fine to have got that far.
 
 **What to watch in the log, in order.**
 
