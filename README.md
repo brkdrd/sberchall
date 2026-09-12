@@ -71,7 +71,73 @@ README – описание данных и инструкции по запус
 
 ---
 
-# Solution: learned-optimizer transformer
+# Solution: the node-chain policy
+
+A chain of **nodes**. A node is a point in angle space, and it owns its **surroundings**:
+`k` probes sampled in a ball around it, each evaluated and then run forward under Adam.
+That is what the model observes — not one number saying how good the node is, but what the
+landscape does around it and which way the local flow runs.
+
+```
+root  <- RootMLP(h), explored
+repeat:
+    child 1 <- head + policy(head's surroundings)
+    child 2 <- head + policy(head's surroundings, child 1's)
+    child 3 <- head + policy(head's surroundings, child 1's, child 2's)
+    head, parent, grandparent <- child 3, head, parent
+```
+
+The first two children are probes the policy places deliberately and then reads before
+committing; the third is the commitment and becomes the next head. The policy sees three
+generations back, which is what lets it recognise a direction it has already tried.
+
+### Why REINFORCE and not backpropagation
+
+Every node is `parent centre + emitted offset`, so a chain is a plain sequence of actions
+and a pathwise gradient through it *is* available. It is still the wrong estimator. The
+reward comes from the Adam finishes inside the surroundings, and `start -> finish` is
+piecewise constant in value: its derivative is zero inside a basin and undefined at the
+boundary between two. The event the policy has to learn is **which basin a node falls
+into**, and that is exactly the event a pathwise gradient cannot see. So surroundings are
+detached observations, the only gradient path is the action log-probs, and the terminal
+reward — the best value in the final head's surroundings — is credited to the whole chain.
+
+`chains` chains run per instance and each is scored against the mean of its siblings.
+Leave-one-out, so the baseline is independent of the chain it corrects and the estimator
+stays unbiased; a single terminal reward over ~13 actions does not train without one.
+
+### Three choices that carry weight
+
+- **Positions in tokens are relative to the head**, and so is the emitted offset, so a
+  configuration of probes means the same thing wherever the head sits. The absolute
+  position enters once, through the adaLN conditioning, because the landscape is *not*
+  translation invariant — `gamma = 0` is a real place and the policy has to know where it
+  is.
+- **Roles are an embedding, not a sequence position.** The context is a set of probes
+  tagged by which node owns them; ordering them would invent structure that is not in the
+  data. A learned readout token replaces "take the last position" — and because context is
+  addressed by role, neither the probe count nor the chain length is baked into the model,
+  so **inference runs a bigger chain than training on the same weights**.
+- **The offset head is zero-initialised** (adaLN-Zero, as in `model.py`), so an untrained
+  chain is a random walk of scale `sigma` rather than a random jump of unbounded size: the
+  run degrades to structured multistart instead of to noise.
+
+### The control is part of the result
+
+Most of a chain's compute is the Adam refinement inside its surroundings, and that
+produces good angles whether or not a policy chose where to put them. Every evaluation
+therefore also runs `random_control` at a matched forward-pass budget. The gap between the
+two lines is the result; the chain's own number alone says nothing.
+
+Code: `src/policy.py` (RootMLP + NodePolicy), `src/chain.py` (nodes, the exploration
+operator, the cycle, tokenisation, the control), `src/reinforce.py` (training, evaluation,
+submission), `src/refine.py` (the shared score/refine primitives).
+
+`src/reinforce.py` also *measures* where the root should start rather than assuming it:
+`probe_root_scale` scores a TQA schedule plus a short polish across `gamma_top` in
+0.16..32 and starts the policy at the winner.
+
+# Previous solution: learned-optimizer transformer
 
 A decoder-only transformer conditioned on the instance vector `h` via **adaLN-Zero**
 (DiT-style) that acts as a *learned optimiser* over QAOA angles. There are no angle
@@ -210,27 +276,47 @@ Self-contained and GPU-first, meant for Kaggle/Colab; see `RUNNING.md`.
 ## Running with Docker
 
 Requires Docker with the NVIDIA container toolkit for GPU (a CPU fallback is provided).
+Training the node-chain policy is a GPU-box job, and this is how it is run.
 
 ```bash
-# the whole experiment, exactly as Kaggle runs it: preflight -> train -> validate -> summary
+docker compose build                        # once, and after any change to src/
+
+# ~1 minute at toy size: proves the image, the mounts and the GPU before an 8h run
+docker compose run --rm reinforce-smoke
+
+# the real training run, detached; checkpoints and history land in ./runs/reinforce
+docker compose up -d reinforce
+docker compose logs -f reinforce
+
+# every hyperparameter is a flag — override by replacing the command
+docker compose run --rm reinforce python -m src.reinforce --lr 1e-4 --chains 16 --iters 6
+
+# inference -> runs/submission.csv, from the best checkpoint
+docker compose run --rm reinforce-predict
+# before h_test exists, measure the identical path on h_train:
+docker compose run --rm reinforce-predict python -m src.reinforce \
+    --ckpt runs/reinforce/best.pt --predict data/raw/h_train.npy \
+    --submission runs/submission_train.csv
+
+# no model: the gamma-box sweep, then the winning rung over all 500 instances (~10 min).
+# Writes a submission — the floor under any learned result.
+docker compose run --rm gscan
+```
+
+`./data` and `./runs` are bind-mounted, so `h_test.npy` is usable the day it lands with no
+rebuild, and checkpoints survive the container.
+
+The previous solution stays runnable:
+
+```bash
+# the entry point Kaggle runs: preflight -> the mode in src/experiment.py -> summary
 docker compose run --rm experiment
 
-# train only (checkpoints + logs land in ./runs)
+# the learned-optimizer transformer: train / validate / predict
 docker compose run --rm train
-
-# no GPU available:
-docker compose run --rm train-cpu
-
-# validate a trained model on h_train with the full inference stack
-# (best-of-256 rollouts + 100 Adam polish steps; auto-picks newest runs/**/best.pt)
+docker compose run --rm train-cpu        # no GPU available
 docker compose run --rm validate
-# or explicitly:
-docker compose run --rm validate python -m src.validate --ckpt runs/longer/best.pt --restarts 256 --polish 100
-
-# inference -> runs/submission.csv (expects data/raw/h_test.npy and runs/best.pt)
 docker compose run --rm predict
-# or with options:
-docker compose run --rm predict python -m src.predict --h data/raw/h_test.npy --restarts 64 --polish 50
 ```
 
 Without Docker: `pip install -r requirements.txt`, then from the repo root

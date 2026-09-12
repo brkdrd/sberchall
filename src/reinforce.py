@@ -251,12 +251,23 @@ def main(argv=None):
         g, m = probe_root_scale(sim, probe_h, cfg, args.root_beta_top)
         print(f"  -> root_gamma_top = {g} (was {args.root_gamma_top}), mean P {m:.5f}\n")
         args.root_gamma_top = g
-    root, policy = build(args, dev)
 
-    if args.ckpt:
+    if args.ckpt is None:
+        root, policy = build(args, dev)
+    else:
         ck = torch.load(args.ckpt, map_location=dev, weights_only=False)
+        # the checkpoint carries the shape it was built at, so predicting from it does not
+        # mean retyping every architecture flag. The *chain* config deliberately does not
+        # come along: inference runs a bigger chain than training on the same weights.
+        for k in ("d_model", "layers", "heads", "root_dim", "root_layers",
+                  "root_gamma_top", "root_beta_top"):
+            if k in ck.get("args", {}):
+                setattr(args, k, ck["args"][k])
+        root, policy = build(args, dev)
         root.load_state_dict(ck["root"])
         policy.load_state_dict(ck["policy"])
+        root.eval()
+        policy.eval()
         print(f"loaded {args.ckpt} (mean P {ck.get('mean_p', float('nan')):.5f})")
 
     if args.predict is not None:

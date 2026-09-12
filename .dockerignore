@@ -1,0 +1,11 @@
+# the image needs src/ and data/raw/ and nothing else; keep the build context small
+.git/
+runs/
+notebooks/
+kaggle/
+data/generated/
+**/__pycache__/
+*.pt
+*.npz
+*.csv
+!data/raw/*.npy

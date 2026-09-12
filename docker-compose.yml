@@ -1,65 +1,104 @@
+# Every service wants the same two mounts, and every GPU service the same reservation.
+# Written once as YAML anchors so adding a service is three lines, not fifteen.
+x-mounts: &mounts
+  - ./runs:/app/runs
+  - ./data:/app/data
+
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
 services:
+  # ---- the node-chain policy (src/policy.py, src/chain.py, src/reinforce.py) ----------
+  # RootMLP places the first node from h; the transformer emits the offset to each next
+  # node from the surroundings of the head, its parent, its grandparent and its existing
+  # children. REINFORCE on the best value in the final head's surroundings.
+  #
+  #   docker compose build                       # once, and after any change to src/
+  #   docker compose run --rm reinforce-smoke    # ~1 min: does the image work at all
+  #   docker compose up -d reinforce             # the real run, detached
+  #   docker compose logs -f reinforce
+  #
+  # Every hyperparameter is a flag; append them to override:
+  #   docker compose run --rm reinforce python -m src.reinforce --lr 1e-4 --chains 16
+  reinforce:
+    build: .
+    command: >
+      python -m src.reinforce
+      --out-dir runs/reinforce
+      --max-hours 8
+      --batch 32 --chains 8 --adv-norm
+      --k 6 --iters 4 --adam-steps 12
+      --infer-k 8 --infer-iters 10 --infer-adam-steps 25 --infer-chains 4
+    volumes: *mounts
+    <<: *gpu
+
+  # the same path at toy size: proves the image, the mounts and the GPU before an 8h run
+  reinforce-smoke:
+    build: .
+    command: >
+      python -m src.reinforce
+      --out-dir runs/smoke --train-iters 3 --batch 2 --chains 2
+      --k 2 --iters 1 --adam-steps 2 --chunk 32 --probe-root 4
+      --eval-every 3 --eval-instances 4 --eval-chains 1
+      --infer-k 2 --infer-iters 1 --infer-adam-steps 2 --infer-chains 1
+    volumes: *mounts
+    <<: *gpu
+
+  # inference -> runs/submission.csv. h_test lands two days before the deadline; until
+  # then point --predict at h_train to measure the same path end to end.
+  reinforce-predict:
+    build: .
+    command: >
+      python -m src.reinforce
+      --ckpt runs/reinforce/best.pt
+      --predict data/raw/h_test.npy
+      --submission runs/submission.csv
+      --infer-k 8 --infer-iters 10 --infer-adam-steps 25 --infer-chains 4
+    volumes: *mounts
+    <<: *gpu
+
+  # ---- search, no model ---------------------------------------------------------------
+  # The gamma-box sweep, then the winning rung over all 500 instances. No training stage,
+  # ~10 min on a T4, and it writes a submission — the floor under any learned result.
+  gscan:
+    build: .
+    command: python -m src.gscan --instances 16 --out runs/gscan.npz --full
+    volumes: *mounts
+    <<: *gpu
+
+  # ---- the previous solution, kept runnable -------------------------------------------
+  # the entry point Kaggle runs: preflight -> the mode in src/experiment.py -> summary
+  experiment:
+    build: .
+    command: python -m src
+    volumes: *mounts
+    <<: *gpu
+
   train:
     build: .
-    volumes:
-      - ./runs:/app/runs
-      - ./data:/app/data
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    volumes: *mounts
+    <<: *gpu
 
   # fallback for machines without an NVIDIA runtime (slow but functional)
   train-cpu:
     build: .
-    volumes:
-      - ./runs:/app/runs
-      - ./data:/app/data
-
-  # the same entry point Kaggle runs: preflight -> train -> validate -> summary,
-  # configured by CONFIG in src/experiment.py
-  experiment:
-    build: .
-    command: python -m src
-    volumes:
-      - ./runs:/app/runs
-      - ./data:/app/data
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    volumes: *mounts
 
   predict:
     build: .
     command: python -m src.predict
-    volumes:
-      - ./runs:/app/runs
-      - ./data:/app/data
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    volumes: *mounts
+    <<: *gpu
 
   # full inference stack (best-of-K rollouts + Adam polish) scored on h_train
   validate:
     build: .
     command: python -m src.validate
-    volumes:
-      - ./runs:/app/runs
-      - ./data:/app/data
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    volumes: *mounts
+    <<: *gpu

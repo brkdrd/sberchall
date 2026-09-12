@@ -323,6 +323,49 @@ Artefacts are written straight to `/kaggle/working` (so they appear in the outpu
 being a machine-readable record of commit, config, timings and scores, so runs stay
 comparable.
 
+
+## The node-chain policy (Docker, GPU box)
+
+The current main line. It does not run on Kaggle — it is a Docker job on a GPU machine.
+Full architecture in `README.md`; this is the operational side.
+
+```bash
+docker compose build
+docker compose run --rm reinforce-smoke     # ~1 min, proves image + mounts + GPU
+docker compose up -d reinforce              # the real run
+docker compose logs -f reinforce
+```
+
+**What to watch in the log, in order.**
+
+1. `root scale probe` — a table of `gamma_top` against mean P for a TQA schedule plus a
+   short polish. This is the run deciding where the root starts, by measurement. If the
+   winner sits at the edge of the ladder, widen `ROOT_LADDER` in `src/reinforce.py`.
+2. `chain: N nodes x k probes x (1 + 2*adam_steps) = ... forward passes` — the cost of one
+   chain, and then the cost of one training iteration. Multiply by the iteration rate to
+   see where the wall clock goes before waiting for it.
+3. `it ... P(terminal)` every `--log-every` iterations. This is the number that has to
+   climb. If it is flat after a few hundred iterations, the terminal-only credit
+   assignment is the first suspect: one scalar shared by ~13 actions is the known hard
+   case for REINFORCE.
+4. `eval@... mean P ... | control ...` every `--eval-every`. **The control is the result.**
+   It spends an identical forward-pass budget on random restarts, so `mean P` above
+   `control` is the only evidence the policy contributed anything. Below it, the chain is
+   an expensive way to run Adam.
+5. The final line prints seconds for 500 instances against the competition's 600 s
+   inference limit.
+
+**Budget.** A chain costs `(1 + 3*iters) * k * (1 + 2*adam_steps)` forward passes; an
+iteration costs that times `batch * chains`. Training deliberately runs a cheaper chain
+than inference — context is addressed by role, so the same weights drive a longer chain
+with more probes at predict time (`--infer-k`, `--infer-iters`, `--infer-adam-steps`).
+
+**Stopping and resuming.** `--max-hours` caps the wall clock; `best.pt` is written at every
+evaluation, so killing the container loses at most one evaluation interval. Restart from a
+checkpoint with `--ckpt runs/reinforce/best.pt`, which also restores the architecture
+shape — predicting never means retyping the model flags.
+
+
 ## Reading the results
 
 The evaluation table is the point of the notebook. `best CONSTANT angles` is the number that
