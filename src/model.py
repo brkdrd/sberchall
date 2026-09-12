@@ -27,10 +27,11 @@ class Block(nn.Module):
         nn.init.zeros_(self.ada.weight)
         nn.init.zeros_(self.ada.bias)
 
-    def forward(self, x, c, attn_mask):
+    def forward(self, x, c, attn_mask=None, key_padding_mask=None):
         s1, sc1, g1, s2, sc2, g2 = self.ada(c).chunk(6, dim=-1)
         y = modulate(self.norm1(x), s1, sc1)
-        a, _ = self.attn(y, y, y, attn_mask=attn_mask, need_weights=False)
+        a, _ = self.attn(y, y, y, attn_mask=attn_mask, need_weights=False,
+                         key_padding_mask=key_padding_mask)
         x = x + g1.unsqueeze(1) * a
         y = modulate(self.norm2(x), s2, sc2)
         x = x + g2.unsqueeze(1) * self.mlp(y)

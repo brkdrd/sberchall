@@ -33,6 +33,7 @@ import torch
 from . import anytime as anytime_mod
 from . import basins as basins_mod
 from . import gscan as gscan_mod
+from . import reinforce as reinforce_mod
 from . import lbfgs as lbfgs_mod
 from . import proposer as proposer_mod
 from . import train as train_mod
@@ -51,13 +52,45 @@ CONFIG = {
     "name": "proposer",     # names the run directory when not on Kaggle
     # NOTE: adding a new mode must never change this line. Doing so silently runs a
     # different experiment than the one the last change was made for.
-    "mode": "gscan",        # "gscan" = gamma-box sweep (diagnostic, no submission);
+    "mode": "reinforce",    # "reinforce" = node-chain policy trained by REINFORCE;
+                            # "gscan" = gamma-box sweep (diagnostic, no submission);
                             # "lbfgs" = batched quasi-Newton search (no training stage);
                             # "turbo" = trust-region BO (no training stage at all);
                             # "anytime" = per-instance budget/quality profiling (an
                             # analysis run -- writes no submission);
                             # "proposer" = learned restarts; "rollout" = learned optimiser
     "seed": 0,
+
+    # ---- mode="reinforce" --------------------------------------------------------------
+    # A chain of nodes, each surrounded by probes that are sampled and then Adam-refined.
+    # The root MLP places the first node from h alone; the transformer emits the offset to
+    # each next node, reading the surroundings of the head, its parent, its grandparent and
+    # whichever children already exist. Terminal reward = best value in the last head's
+    # surroundings, credited to the whole chain (REINFORCE, leave-one-out baseline).
+    "rl_hours": 8.0,          # wall-clock cap; the iteration count rarely binds
+    "rl_train_iters": 100000,
+    "rl_batch": 32,           # instances per iteration (synthesised, h_train held out)
+    "rl_chains": 8,           # chains per instance = the baseline's sample size
+    "rl_lr": 3e-4,
+    "rl_adv_norm": True,
+    # the training chain — deliberately cheaper than the inference one
+    "rl_k": 6,                # probes per node
+    "rl_iters": 4,            # head advances per chain
+    "rl_adam_steps": 12,      # Adam steps from each probe
+    "rl_radius_gamma": 0.35,  # the ball the probes come from (a hyperparameter, per half)
+    "rl_radius_beta": 0.25,
+    "rl_sigma_gamma": 0.30,   # exploration noise on the emitted offset
+    "rl_sigma_beta": 0.20,
+    "rl_chunk": 512,          # rows refined at once (~2 MB of VRAM per row)
+    "rl_probe_root": 128,     # instances used to measure where the root starts
+    # the inference chain — same weights, more of everything
+    "rl_infer_k": 8,
+    "rl_infer_iters": 10,
+    "rl_infer_adam": 25,
+    "rl_infer_chains": 4,
+    "rl_eval_every": 250,
+    "rl_eval_instances": 128,
+    "rl_eval_chains": 2,
 
     # ---- mode="gscan" ----------------------------------------------------------------
     # Sweeps the gamma sampling half-width over a geometric ladder in raw radians. Tests
@@ -160,6 +193,22 @@ QUICK = {
     "gscan_deep": 20,
     "gscan_chunk": 64,
     "gscan_full": False,
+    "rl_train_iters": 3,
+    "rl_hours": 0.05,
+    "rl_batch": 2,
+    "rl_chains": 2,
+    "rl_k": 2,
+    "rl_iters": 1,
+    "rl_adam_steps": 2,
+    "rl_chunk": 32,
+    "rl_probe_root": 4,
+    "rl_infer_k": 2,
+    "rl_infer_iters": 1,
+    "rl_infer_adam": 2,
+    "rl_infer_chains": 1,
+    "rl_eval_every": 3,
+    "rl_eval_instances": 4,
+    "rl_eval_chains": 1,
     "lbfgs_budget": 600,
     "lbfgs_hours": 0.05,
     "anytime_extra": 24,
@@ -368,6 +417,34 @@ def main(argv=None):
     scale_info = preflight(args.data_dir, args.device)
     submission = out_dir / "submission_train.csv"
     extra = {}
+
+    if cfg["mode"] == "reinforce":
+        stage("reinforce")
+        va = reinforce_mod.main([
+            "--data-dir", str(args.data_dir), "--out-dir", str(out_dir),
+            "--train-iters", str(cfg["rl_train_iters"]),
+            "--max-hours", str(cfg["rl_hours"]), "--batch", str(cfg["rl_batch"]),
+            "--chains", str(cfg["rl_chains"]), "--lr", str(cfg["rl_lr"]),
+            "--k", str(cfg["rl_k"]), "--iters", str(cfg["rl_iters"]),
+            "--adam-steps", str(cfg["rl_adam_steps"]),
+            "--radius-gamma", str(cfg["rl_radius_gamma"]),
+            "--radius-beta", str(cfg["rl_radius_beta"]),
+            "--sigma-gamma", str(cfg["rl_sigma_gamma"]),
+            "--sigma-beta", str(cfg["rl_sigma_beta"]),
+            "--chunk", str(cfg["rl_chunk"]), "--probe-root", str(cfg["rl_probe_root"]),
+            "--infer-k", str(cfg["rl_infer_k"]), "--infer-iters", str(cfg["rl_infer_iters"]),
+            "--infer-adam-steps", str(cfg["rl_infer_adam"]),
+            "--infer-chains", str(cfg["rl_infer_chains"]),
+            "--eval-every", str(cfg["rl_eval_every"]),
+            "--eval-instances", str(cfg["rl_eval_instances"]),
+            "--eval-chains", str(cfg["rl_eval_chains"]),
+            "--seed", str(cfg["seed"]), "--device", args.device,
+        ] + (["--adv-norm"] if cfg["rl_adv_norm"] else []))
+        summary = {"commit": git_sha(), "config": cfg, "scale": scale_info,
+                   "reinforce": va, "total_seconds": time.time() - t0}
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+        print(f"\ntotal {(time.time() - t0) / 60:.1f} min. artefacts in {out_dir}")
+        return summary
 
     if cfg["mode"] == "gscan":
         stage("gscan")

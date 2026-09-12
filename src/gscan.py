@@ -46,6 +46,7 @@ import numpy as np
 import torch
 
 from .predict import write_submission
+from .refine import refine, score
 from .qaoa_ref import QAOA, P as DEPTH
 
 N_ANGLES = 2 * DEPTH
@@ -87,45 +88,6 @@ def sample_start_angles(kind, n, gmax, gen, device):
         return torch.cat([g, b], dim=1)
 
     raise ValueError(f"unknown init {kind!r}")
-
-
-@torch.no_grad()
-def score(sim, h, ang, chunk=4096):
-    """P(ground) for a batch of (h, angles) rows, via the organisers' simulator."""
-    out = []
-    for lo in range(0, ang.shape[0], chunk):
-        a, hh = ang[lo:lo + chunk], h[lo:lo + chunk]
-        out.append(sim.p_ground(hh, a[:, :DEPTH], a[:, DEPTH:]))
-    return torch.cat(out)
-
-
-def refine(sim, h, ang, steps, lr_gamma, lr_beta, chunk=1024):
-    """Adam on the angles in radians. Returns the best point *visited*, not the last.
-
-    P(ground) is not monotone along an Adam path, so keeping the final iterate throws
-    away better points the path passed through. Separate step sizes for the two halves
-    because a step meaningful for beta is invisible to a gamma of order 10.
-    """
-    best_ang, best_p = ang.clone(), score(sim, h, ang, chunk)
-    for lo in range(0, ang.shape[0], chunk):
-        sl = slice(lo, min(lo + chunk, ang.shape[0]))
-        g = ang[sl, :DEPTH].clone().requires_grad_(True)
-        b = ang[sl, DEPTH:].clone().requires_grad_(True)
-        opt = torch.optim.Adam([{"params": [g], "lr": lr_gamma},
-                                {"params": [b], "lr": lr_beta}])
-        for _ in range(steps):
-            opt.zero_grad(set_to_none=True)
-            p = sim.p_ground(h[sl], g, b)
-            (-p.clamp_min(1e-30).log()).sum().backward()
-            opt.step()
-            with torch.no_grad():
-                cur = torch.cat([g, b], dim=1)
-                better = p.detach() > best_p[sl]
-                if better.any():
-                    idx = torch.nonzero(better, as_tuple=True)[0]
-                    best_p[sl.start + idx] = p.detach()[idx]
-                    best_ang[sl.start + idx] = cur[idx]
-    return best_ang, best_p
 
 
 def rung(sim, h, inst, n_starts, top, steps, lr, gmax, gen, device, chunk,
