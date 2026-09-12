@@ -342,6 +342,22 @@ docker compose ps                             # and this says whether it is stil
 feed and `./runs/reinforce/run.json` is written before the first iteration, so an empty
 directory means the container never got going rather than that it is quiet.
 
+Restarting after a change to `src/` — the running container holds the old image, so it has
+to be replaced, not just rebuilt:
+
+```bash
+docker compose down                           # stop and remove it
+git pull && docker compose build
+docker compose up reinforce                   # attached; Ctrl+C stops the run
+# or, for a run that should outlive the terminal:
+docker compose up -d reinforce && docker compose logs -f reinforce
+```
+
+Attached, `Ctrl+C` stops the container. Following a detached run, `Ctrl+C` leaves the log
+feed and the run continues; `docker compose stop reinforce` is what ends it. Either way
+`best.pt` and `history.json` are current as of the last evaluation, so a stop costs at most
+one eval interval and `--ckpt runs/reinforce/best.pt` picks the weights back up.
+
 **Before anything else, check the host can do GPU containers.** `deploy.resources` asks
 for the `nvidia` driver, and if the daemon has no such runtime the container fails at
 start instead of falling back:
