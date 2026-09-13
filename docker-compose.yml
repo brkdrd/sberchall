@@ -93,6 +93,11 @@ services:
     <<: [*build, *gpu]
     command: python -m src.library --npz runs/gscan.npz --out runs/library_submission.csv
 
+  # Physics or search? Retries the worst instances at ~40x budget across a gamma ladder.
+  hard:
+    <<: [*build, *gpu]
+    command: python -m src.hard --npz runs/gscan.npz --instances 48
+
   # ---- the previous solution, kept runnable -------------------------------------------
   # the entry point Kaggle runs: preflight -> the mode in src/experiment.py -> summary
   experiment:
