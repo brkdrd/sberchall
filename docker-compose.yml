@@ -39,7 +39,7 @@ services:
       python -m src.reinforce
       --out-dir runs/reinforce
       --max-hours 8
-      --batch 32 --chains 8 --adv-norm
+      --batch 64 --chains 8 --adv-norm
       --k 6 --iters 4 --adam-steps 12
       --infer-k 8 --infer-iters 10 --infer-adam-steps 25 --infer-chains 4
 

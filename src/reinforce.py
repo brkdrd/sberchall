@@ -82,6 +82,65 @@ def device_banner(device):
                 f"and the driver's own ceiling is the 'CUDA Version' field in nvidia-smi.")
 
 
+
+@torch.no_grad()
+def _time_forward(sim, h, ang, grad, iters=3):
+    import time as _t
+    if grad:
+        g = ang[:, :DEPTH].clone().requires_grad_(True)
+        b = ang[:, DEPTH:].clone().requires_grad_(True)
+    for i in range(iters + 1):
+        if i == 1:
+            torch.cuda.synchronize() if ang.is_cuda else None
+            t0 = _t.time()
+        if grad:
+            with torch.enable_grad():
+                p = sim.p_ground(h, g, b)
+                p.log().sum().backward()
+        else:
+            sim.p_ground(h, ang[:, :DEPTH], ang[:, DEPTH:])
+    torch.cuda.synchronize() if ang.is_cuda else None
+    return (_t.time() - t0) / iters
+
+
+def benchmark(sim, device, sizes=None):
+    """Where does the wall clock go, and at what batch size does it stop going there?
+
+    Run 1 spent 3.8 min on an iteration of 499k forward passes — 2.2k/s, against 67k/s for
+    the same `refine` inside the gamma sweep. A circuit this small is launch-bound, not
+    compute-bound: ~180 kernels per forward-and-backward over a 4096-wide state, each a few
+    microseconds of work. Under WSL2 paravirtualisation a launch costs far more than that,
+    so throughput is set by how many rows ride along with each launch. This measures it
+    rather than assuming, and the right `--chunk` is wherever rows/s stops climbing.
+    """
+    # a CPU is bandwidth-bound and gains nothing from big batches, so do not spend
+    # minutes measuring that; the question only has a useful answer on a GPU
+    if sizes is None:
+        sizes = (256, 1024, 4096, 16384) if str(device).startswith("cuda") else (64, 256)
+    print("throughput (the circuit is launch-bound, so bigger chunks are nearly free):")
+    print(f"{'rows':>8} {'fwd ms':>9} {'fwd rows/s':>12} {'fwd+bwd ms':>11} "
+          f"{'fwd+bwd rows/s':>15}")
+    best = sizes[0]
+    top = 0.0
+    for n in sizes:
+        try:
+            h = torch.rand(n, H_DIM, device=device) * 2 - 1
+            ang = torch.rand(n, N_ANGLES, device=device)
+            f = _time_forward(sim, h, ang, False)
+            g = _time_forward(sim, h, ang, True)
+            rate = n / g
+            if rate > top:
+                top, best = rate, n
+            print(f"{n:8d} {f * 1e3:9.1f} {n / f:12,.0f} {g * 1e3:11.1f} {rate:15,.0f}")
+        except torch.cuda.OutOfMemoryError:
+            print(f"{n:8d}  out of memory")
+            torch.cuda.empty_cache()
+            break
+    print(f"  -> fwd+bwd throughput peaks around {best} rows "
+          f"({top:,.0f} rows/s); --chunk should be at least that\n")
+    return best
+
+
 def synth(batch, device, gen):
     """Fresh instances. h_train is i.i.d. U(-1, 1), so training data is free and the
     official 500 stay held out."""
@@ -227,7 +286,9 @@ def train(args, root, policy, sim, h_eval, cfg, device, out_dir, schedule, jitte
     for it in range(1, args.train_iters + 1):
         h = synth(args.batch, device, gen)
         hrep = h.repeat_interleave(args.chains, dim=0)
+        t_roll = time.time()
         out = rollout(root, policy, sim, hrep, cfg, gen)
+        t_roll = time.time() - t_roll
 
         r = out["reward"].view(args.batch, args.chains).detach()
         if args.chains > 1:
@@ -239,17 +300,22 @@ def train(args, root, policy, sim, h_eval, cfg, device, out_dir, schedule, jitte
             adv = adv / adv.std().clamp_min(1e-6)
         loss = -(out["logp"].view(args.batch, args.chains) * adv).mean()
 
+        t_back = time.time()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(
             list(root.parameters()) + list(policy.parameters()), args.clip)
         opt.step()
+        t_back = time.time() - t_back
 
         if it % args.log_every == 0:
             print(f"  it {it:5d}  R {r.mean().item():8.3f}  "
                   f"P(terminal) {r.exp().mean().item():.5f}  "
                   f"|adv| {adv.abs().mean().item():7.3f}  "
-                  f"grad {gnorm.item():8.2f}  [{(time.time() - t0) / 60:.1f} min]")
+                  f"grad {gnorm.item():8.2f}  "
+                  f"{args.batch * args.chains * cfg.evals_per_chain() / t_roll / 1e3:6.1f}k "
+                  f"fwd/s  (chain {t_roll:.1f}s, learn {t_back:.2f}s)  "
+                  f"[{(time.time() - t0) / 60:.1f} min]")
 
         if it % args.eval_every == 0 or it == args.train_iters:
             ev = evaluate(root, policy, sim, h_eval, cfg, gen, args.eval_chains,
@@ -308,6 +374,8 @@ def main(argv=None):
     ap.add_argument("--root-gamma-top", type=float, default=1.0)
     ap.add_argument("--probe-root", type=int, default=64,
                     help="instances used to measure --root-gamma-top; 0 trusts the flag")
+    ap.add_argument("--benchmark", type=int, default=1,
+                    help="measure circuit throughput at startup and raise --chunk to match")
     ap.add_argument("--auto-sigma", type=int, default=1,
                     help="measure the exploration scales from the landscape; 0 trusts the "
                          "--sigma-* and --radius-* flags")
@@ -334,6 +402,11 @@ def main(argv=None):
     device_banner(dev)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     sim = QAOA(np.load(args.data_dir / "J.npy"), device=dev)
+    if args.benchmark:
+        best = benchmark(sim, dev)
+        if args.chunk < best:
+            print(f"  raising --chunk {args.chunk} -> {best}\n")
+            args.chunk = best
     cfg = chain_config(args)
     gen = torch.Generator(device=dev).manual_seed(args.seed + 1)
 

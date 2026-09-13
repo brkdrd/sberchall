@@ -56,9 +56,15 @@ def refine(sim, h, ang, steps, lr_gamma, lr_beta, chunk=1024, p0=None):
                 (-p.clamp_min(P_FLOOR).log()).sum().backward()
                 opt.step()
                 with torch.no_grad():
-                    better = p.detach() > best_p[sl]
-                    if better.any():
-                        idx = torch.nonzero(better, as_tuple=True)[0]
-                        best_p[lo + idx] = p.detach()[idx]
-                        best_ang[lo + idx] = torch.cat([g, b], dim=1).detach()[idx]
+                    # Branchless on purpose. `if better.any()` and `torch.nonzero` both
+                    # force a GPU->CPU synchronisation, and this runs once per Adam step
+                    # per chunk — so the pipeline was drained thousands of times a second
+                    # and never got to queue any work. torch.where costs one extra kernel
+                    # and no stall.
+                    pd = p.detach()
+                    better = pd > best_p[sl]
+                    best_p[sl] = torch.where(better, pd, best_p[sl])
+                    best_ang[sl] = torch.where(better.unsqueeze(1),
+                                               torch.cat([g, b], dim=1).detach(),
+                                               best_ang[sl])
     return best_ang, best_p
