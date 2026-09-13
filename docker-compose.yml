@@ -81,7 +81,11 @@ services:
   # ~10 min on a T4, and it writes a submission — the floor under any learned result.
   gscan:
     <<: [*build, *gpu]
-    command: python -m src.gscan --instances 16 --out runs/gscan.npz --full
+    command: >
+      python -m src.gscan --out runs/gscan.npz --full
+      --instances 16 --starts 65536 --top 128 --steps 600
+      --scales 0.25,0.5,1.0,2.0 --deep 8000
+      --full-starts 65536 --full-top 128 --full-steps 600
 
   # ---- the previous solution, kept runnable -------------------------------------------
   # the entry point Kaggle runs: preflight -> the mode in src/experiment.py -> summary

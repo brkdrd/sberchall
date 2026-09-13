@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .chain import ChainConfig, N_ANGLES, random_control, rollout
+from .chain import ChainConfig, N_ANGLES, random_control, rollout, vec
 from .qaoa_ref import P as DEPTH
 from .refine import refine
 from .policy import NodePolicy, RootMLP
@@ -89,6 +89,46 @@ def synth(batch, device, gen):
 
 
 ROOT_LADDER = (0.16, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
+JITTER_LADDER = (0.02, 0.05, 0.10, 0.20, 0.40, 0.80)
+
+
+def tqa_angles(gamma_top, beta_top, n, device):
+    """The annealing schedule, in radians, repeated for `n` instances."""
+    l = torch.arange(1, DEPTH + 1, device=device, dtype=torch.float32)
+    a = torch.cat([(l / DEPTH) * gamma_top, (1.0 - l / DEPTH) * beta_top])
+    return a.unsqueeze(0).expand(n, -1).contiguous()
+
+
+def probe_jitter(sim, h, cfg, gamma_top, beta_top, steps=40, keep=0.95):
+    """How far can a start be moved off the schedule before quality goes with it?
+
+    This is the question the first run got wrong by assuming an answer. It ran with
+    `sigma_root_gamma = 0.6` against a schedule whose mean |gamma| is 0.30 — noise at twice
+    the amplitude of the signal — so every chain began by throwing away the one thing that
+    was known to work, and 50k forward passes per instance ended up below a single
+    schedule point polished for 40 steps.
+
+    Exploration should be as wide as it can be without costing quality, so the rule is the
+    *largest* jitter still within `keep` of the best, measured per half because gamma and
+    beta do not share a scale.
+    """
+    dev = h.device
+    base = tqa_angles(gamma_top, beta_top, h.shape[0], dev)
+    out = {}
+    for half, lo, hi in (("gamma", 0, DEPTH), ("beta", DEPTH, 2 * DEPTH)):
+        rows = []
+        for sig in JITTER_LADDER:
+            ang = base.clone()
+            ang[:, lo:hi] += sig * torch.randn(h.shape[0], hi - lo, device=dev)
+            _, p = refine(sim, h, ang, steps, cfg.lr_gamma, cfg.lr_beta, cfg.chunk)
+            rows.append((sig, p.mean().item()))
+        best = max(r[1] for r in rows)
+        pick = max(s for s, m in rows if m >= keep * best)
+        print(f"jitter probe, {half} (schedule + N(0, sigma), {steps} Adam steps):")
+        for sig, m in rows:
+            print(f"    sigma {sig:5.2f}  mean P {m:.5f}" + ("   <-" if sig == pick else ""))
+        out[half] = pick
+    return out["gamma"], out["beta"]
 
 
 def probe_root_scale(sim, h, cfg, beta_top, ladder=ROOT_LADDER, steps=40):
@@ -139,7 +179,8 @@ def infer_config(args, cfg):
 
 
 @torch.no_grad()
-def evaluate(root, policy, sim, h, cfg, gen, chains, control=True):
+def evaluate(root, policy, sim, h, cfg, gen, chains, control=True, schedule=None,
+             jitter=None):
     """Best-of-`chains` per instance, plus the matched-budget random control."""
     n, dev = h.shape[0], h.device
     rows = torch.arange(n, device=dev)
@@ -157,14 +198,14 @@ def evaluate(root, policy, sim, h, cfg, gen, chains, control=True):
            "terminal_p": out["reward"].exp().mean().item(),
            "evals_per_instance": chains * cfg.evals_per_chain(),
            "seconds": secs, "angles": best_pt}
-    if control:
-        centre = root(h)
-        c_lp, _ = random_control(sim, h, res["evals_per_instance"], cfg, gen, centre)
+    if control and schedule is not None:
+        c_lp, _ = random_control(sim, h, res["evals_per_instance"], cfg, gen,
+                                 schedule(h.shape[0]), jitter)
         res["control_p"] = c_lp.exp().mean().item()
     return res
 
 
-def train(args, root, policy, sim, h_eval, cfg, device, out_dir):
+def train(args, root, policy, sim, h_eval, cfg, device, out_dir, schedule, jitter):
     gen = torch.Generator(device=device).manual_seed(args.seed)
     opt = torch.optim.Adam(list(root.parameters()) + list(policy.parameters()), lr=args.lr)
     best, history, t0 = -1.0, [], time.time()
@@ -211,7 +252,8 @@ def train(args, root, policy, sim, h_eval, cfg, device, out_dir):
                   f"grad {gnorm.item():8.2f}  [{(time.time() - t0) / 60:.1f} min]")
 
         if it % args.eval_every == 0 or it == args.train_iters:
-            ev = evaluate(root, policy, sim, h_eval, cfg, gen, args.eval_chains)
+            ev = evaluate(root, policy, sim, h_eval, cfg, gen, args.eval_chains,
+                          schedule=schedule, jitter=jitter)
             ev.pop("angles")
             print(f"  eval@{it}: mean P {ev['mean_p']:.5f} | control "
                   f"{ev.get('control_p', float('nan')):.5f} | "
@@ -266,6 +308,12 @@ def main(argv=None):
     ap.add_argument("--root-gamma-top", type=float, default=1.0)
     ap.add_argument("--probe-root", type=int, default=64,
                     help="instances used to measure --root-gamma-top; 0 trusts the flag")
+    ap.add_argument("--auto-sigma", type=int, default=1,
+                    help="measure the exploration scales from the landscape; 0 trusts the "
+                         "--sigma-* and --radius-* flags")
+    ap.add_argument("--sigma-frac", type=float, default=0.5,
+                    help="probe radius and per-step offset noise, as a fraction of the "
+                         "measured root jitter")
     ap.add_argument("--root-beta-top", type=float, default=0.8)
     # the chain itself — every ChainConfig field is a flag
     for f in fields(ChainConfig):
@@ -294,6 +342,17 @@ def main(argv=None):
         g, m = probe_root_scale(sim, probe_h, cfg, args.root_beta_top)
         print(f"  -> root_gamma_top = {g} (was {args.root_gamma_top}), mean P {m:.5f}\n")
         args.root_gamma_top = g
+        if args.auto_sigma:
+            sg, sb = probe_jitter(sim, probe_h, cfg, args.root_gamma_top,
+                                  args.root_beta_top)
+            f = args.sigma_frac
+            print(f"  -> sigma_root = ({sg}, {sb}) was "
+                  f"({args.sigma_root_gamma}, {args.sigma_root_beta}); "
+                  f"radius and offset noise = {f} x that\n")
+            args.sigma_root_gamma, args.sigma_root_beta = sg, sb
+            args.radius_gamma, args.radius_beta = sg * f, sb * f
+            args.sigma_gamma, args.sigma_beta = sg * f, sb * f
+            cfg = chain_config(args)
 
     if args.ckpt is None:
         root, policy = build(args, dev)
@@ -328,15 +387,19 @@ def main(argv=None):
 
     h_train = torch.tensor(np.load(args.data_dir / "h_train.npy"), dtype=torch.float32,
                            device=dev)
+    schedule = lambda n: tqa_angles(args.root_gamma_top, args.root_beta_top, n, dev)
+    jitter = vec(args.sigma_root_gamma, args.sigma_root_beta, dev)
+
     h_eval = h_train[:args.eval_instances]
-    res = train(args, root, policy, sim, h_eval, cfg, dev, args.out_dir)
+    res = train(args, root, policy, sim, h_eval, cfg, dev, args.out_dir, schedule, jitter)
 
     ck = torch.load(args.out_dir / "best.pt", map_location=dev, weights_only=False)
     root.load_state_dict(ck["root"])
     policy.load_state_dict(ck["policy"])
     icfg = infer_config(args, cfg)
     final = evaluate(root, policy, sim, h_train, icfg, gen,
-                     args.infer_chains or args.eval_chains)
+                     args.infer_chains or args.eval_chains,
+                     schedule=schedule, jitter=jitter)
     write_submission(args.out_dir / "submission_train.csv", final.pop("angles"))
     print(f"\nfull h_train: mean P {final['mean_p']:.5f} | control "
           f"{final['control_p']:.5f} | {final['seconds']:.0f}s for 500 instances "

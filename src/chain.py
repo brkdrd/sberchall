@@ -57,19 +57,25 @@ def vec(g, b, device):
 class ChainConfig:
     """Every knob. The two halves of the angle vector get separate values throughout —
     not a reparameterisation, just the fact that a step meaningful for beta (period pi)
-    is invisible to a gamma of order 10."""
+    is invisible to a gamma of order 10.
+
+    The exploration scales are measured, not chosen: `reinforce.probe_jitter` moves the
+    root schedule by a ladder of sigmas and takes the widest that still holds quality.
+    These defaults are what it returned; the first run shipped with gamma noise at 0.6
+    against a schedule whose mean |gamma| is 0.30, so every chain opened by discarding the
+    one thing known to work."""
 
     k: int = 6                     # probes per node
     iters: int = 4                 # head advances per chain
-    radius_gamma: float = 0.35     # ball the probes are drawn from
-    radius_beta: float = 0.25
+    radius_gamma: float = 0.05     # ball the probes are drawn from
+    radius_beta: float = 0.10
     adam_steps: int = 12           # Adam steps run from each probe
     lr_gamma: float = 0.05
     lr_beta: float = 0.03
-    sigma_gamma: float = 0.30      # exploration noise on the emitted offset
-    sigma_beta: float = 0.20
-    sigma_root_gamma: float = 0.60  # and on the root MLP's point
-    sigma_root_beta: float = 0.40
+    sigma_gamma: float = 0.05      # exploration noise on the emitted offset
+    sigma_beta: float = 0.10
+    sigma_root_gamma: float = 0.10  # and on the root MLP's point
+    sigma_root_beta: float = 0.20
     pos_scale_gamma: float = 1.0   # token input normalisation only
     pos_scale_beta: float = 1.0
     chunk: int = 512               # rows refined at once (VRAM: ~2 MB/row)
@@ -235,28 +241,31 @@ def rollout(root_mlp, policy, sim, h, cfg, gen, explore_scale=1.0):
     }
 
 
-def random_control(sim, h, n_evals, cfg, gen, centre, width=3.0):
-    """Matched-budget control: the same forward passes spent on random restarts.
+def random_control(sim, h, n_evals, cfg, gen, centre, jitter):
+    """Matched-budget control: the same forward passes spent on jittered restarts.
 
     Without this a chain's score says nothing — the compute inside the surroundings would
-    produce a number on its own with no policy at all, and that number is the one a
-    learned policy has to beat. Starts are drawn uniformly from a box centred on the same
-    schedule the untrained root sits at, `width` times the root noise wide, so the control
-    searches the region the policy starts from rather than a different one.
+    produce a number on its own with no policy at all, and that number is what a learned
+    policy has to beat.
+
+    **The control has to be the strong baseline, not a convenient one.** An earlier version
+    drew uniformly from a wide box and reported numbers the chain beat; both were sitting
+    in a region the schedule probe had already measured as bad, so the comparison flattered
+    the policy while both were losing to a single annealing schedule. Starts are now drawn
+    around `centre` — the TQA schedule at the measured scale — with the measured `jitter`,
+    which is the thing that actually works on this landscape.
     """
     per_start = 1 + 2 * cfg.adam_steps
     starts = max(1, n_evals // per_start)
     n, dev = h.shape[0], h.device
-    tens = cfg.tensors(dev)
-    half = tens["sigma_root"] * width
     best_lp = torch.full((n,), -1e30, device=dev)
     best_pt = torch.zeros(n, N_ANGLES, device=dev)
     block = max(1, cfg.chunk // max(n, 1))
     done = 0
     while done < starts:
         b = min(block, starts - done)
-        u = torch.rand(n, b, N_ANGLES, device=dev, generator=gen) * 2 - 1
-        ang = (centre.unsqueeze(1) + u * half).reshape(n * b, N_ANGLES)
+        u = torch.randn(n, b, N_ANGLES, device=dev, generator=gen)
+        ang = (centre.unsqueeze(1) + u * jitter).reshape(n * b, N_ANGLES)
         hrep = h.repeat_interleave(b, dim=0)
         _, p = refine(sim, hrep, ang, cfg.adam_steps, cfg.lr_gamma, cfg.lr_beta, cfg.chunk)
         lp = p.clamp_min(P_FLOOR).log().view(n, b)

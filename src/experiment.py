@@ -77,10 +77,10 @@ CONFIG = {
     "rl_k": 6,                # probes per node
     "rl_iters": 4,            # head advances per chain
     "rl_adam_steps": 12,      # Adam steps from each probe
-    "rl_radius_gamma": 0.35,  # the ball the probes come from (a hyperparameter, per half)
-    "rl_radius_beta": 0.25,
-    "rl_sigma_gamma": 0.30,   # exploration noise on the emitted offset
-    "rl_sigma_beta": 0.20,
+    "rl_radius_gamma": 0.05,  # the ball the probes come from; measured, see probe_jitter
+    "rl_radius_beta": 0.10,
+    "rl_sigma_gamma": 0.05,   # exploration noise on the emitted offset
+    "rl_sigma_beta": 0.10,
     "rl_chunk": 512,          # rows refined at once (~2 MB of VRAM per row)
     "rl_probe_root": 128,     # instances used to measure where the root starts
     # the inference chain — same weights, more of everything
