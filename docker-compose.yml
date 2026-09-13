@@ -87,6 +87,12 @@ services:
       --scales 0.25,0.5,1.0,2.0 --deep 8000
       --full-starts 65536 --full-top 128 --full-steps 600
 
+  # Do the winning angles transfer? Cross-evaluates every angle vector the sweep found
+  # against every instance, greedily covers, polishes, and writes a submission. Seconds.
+  library:
+    <<: [*build, *gpu]
+    command: python -m src.library --npz runs/gscan.npz --out runs/library_submission.csv
+
   # ---- the previous solution, kept runnable -------------------------------------------
   # the entry point Kaggle runs: preflight -> the mode in src/experiment.py -> summary
   experiment:
