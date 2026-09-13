@@ -98,6 +98,11 @@ services:
     <<: [*build, *gpu]
     command: python -m src.hard --npz runs/gscan.npz --instances 48
 
+  # Every plausible reading of "how good is this state", on angles we already have.
+  metrics:
+    <<: [*build, *gpu]
+    command: python -m src.metrics --submission runs/library_submission.csv
+
   # ---- the previous solution, kept runnable -------------------------------------------
   # the entry point Kaggle runs: preflight -> the mode in src/experiment.py -> summary
   experiment:
