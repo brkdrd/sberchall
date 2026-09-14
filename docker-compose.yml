@@ -93,6 +93,14 @@ services:
     <<: [*build, *gpu]
     command: python -m src.library --npz runs/gscan.npz --out runs/library_submission.csv
 
+  # The h_test submission: library from the h_train sweep, evaluated on h_test, top 8
+  # polished. ~7k forward passes per instance — fits Colab's 10 minutes on a T4.
+  library-test:
+    <<: [*build, *gpu]
+    command: >
+      python -m src.library --npz runs/gscan.npz --h data/raw/h_test.npy
+      --out runs/submission.csv
+
   # Physics or search? Retries the worst instances at ~40x budget across a gamma ladder.
   hard:
     <<: [*build, *gpu]
