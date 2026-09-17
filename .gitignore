@@ -4,6 +4,12 @@ labels_*.npz
 *.pt
 submission.csv
 
+# ...but the shipped checkpoint and the submitted angles ARE the deliverable: the Colab
+# notebook loads models/moe_best.pt to reproduce submission.csv without retraining, so it
+# has to be in the repo. Training artefacts under runs/ stay ignored.
+!models/*.pt
+!submission_test.csv
+
 # python
 __pycache__/
 *.py[cod]
