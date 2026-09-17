@@ -132,3 +132,39 @@ services:
   validate:
     <<: [*build, *gpu]
     command: python -m src.validate
+
+  # ---------------------------------------------------------------- mixture of experts
+  # The submitted model: a learned codebook of angle vectors plus a gate that scores them
+  # against h, trained together through the organisers' differentiable simulator.
+
+  # ~1 minute, before committing to the real run.
+  moe-smoke-cpu:
+    <<: *build
+    command: >
+      python -m src.moe --train --device cpu --iters 20 --batch 8
+      --experts 32 --active 16 --polish 0 --top-k 1 --out runs/moe-smoke
+
+  moe-smoke:
+    <<: [*build, *gpu]
+    command: >
+      python -m src.moe --train --iters 50 --batch 32
+      --experts 64 --active 32 --polish 20 --out runs/moe-smoke
+
+  # the real training run; checkpoints and history land in ./runs/moe
+  moe:
+    <<: [*build, *gpu]
+    command: python -m src.moe --train --iters 4000 --out runs/moe
+
+  # h_train, the same code path the submission uses -- this is the number to report
+  moe-validate:
+    <<: [*build, *gpu]
+    command: >
+      python -m src.moe --predict data/raw/sberdata/h_train.npy --ckpt runs/moe/best.pt
+      --submission runs/submission_train.csv
+
+  # the deliverable: angles for h_test
+  moe-predict:
+    <<: [*build, *gpu]
+    command: >
+      python -m src.moe --predict data/raw/sberdata/h_test.npy --ckpt runs/moe/best.pt
+      --submission runs/submission.csv
