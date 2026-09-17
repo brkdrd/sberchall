@@ -379,6 +379,47 @@ def save(model, path):
                 "d_model": model.head.in_features}, path)
 
 
+def init_codebook(model, ang, gamma_box=None):
+    """Seed the codebook with known-good angle vectors.
+
+    A cold codebook starts as noise, so early training spends itself rediscovering angles
+    this repo already has: `submission_train.csv` holds one searched vector per h_train
+    instance, and cross-evaluating those against all instances scores 0.315 with no search
+    at all. Seeding with them makes best-of-codebook a *floor* the gate starts from rather
+    than a target it has to reach, and training then only has to improve on it.
+
+    The codebook is stored pre-squash, so the seed is inverted through atanh. Any vector
+    whose |gamma| exceeds the box would invert to infinity, so the box is widened to fit
+    the data unless the caller pins it.
+    """
+    ang = torch.as_tensor(ang, dtype=torch.float32)
+    m = min(ang.shape[0], model.n_experts)
+    g, b = ang[:m, :DEPTH], ang[:m, DEPTH:]
+    box = gamma_box if gamma_box is not None else max(model.gamma_box,
+                                                      float(g.abs().max()) * 1.05)
+    model.gamma_box = box
+    with torch.no_grad():
+        model.codebook[:m, :DEPTH] = torch.atanh((g / box).clamp(-0.999, 0.999))
+        model.codebook[:m, DEPTH:] = b
+    return m
+
+
+def load_angle_file(path):
+    """Angle vectors from a submission .csv, a plain .npy, or any (*, 10) array in an .npz."""
+    path = Path(path)
+    if path.suffix == ".csv":
+        a = np.loadtxt(path, delimiter=",", skiprows=1)
+        return a[:, 1:] if a.shape[1] == N_ANGLES + 1 else a
+    if path.suffix == ".npy":
+        return np.load(path)
+    z = np.load(path)
+    out = [np.asarray(z[k], dtype=np.float32) for k in z.files
+           if np.asarray(z[k]).ndim == 2 and np.asarray(z[k]).shape[-1] == N_ANGLES]
+    if not out:
+        raise ValueError(f"no (*, {N_ANGLES}) angle array in {path}")
+    return np.unique(np.concatenate(out, axis=0).round(6), axis=0)
+
+
 def load(path, device):
     ck = torch.load(path, map_location=device, weights_only=False)
     m = AngleMoE(n_experts=ck["n_experts"], d_model=ck["d_model"],
@@ -398,7 +439,10 @@ def main(argv=None):
     ap.add_argument("--predict", type=Path, default=None, help="h .npy to predict for")
     ap.add_argument("--ckpt", type=Path, default=None)
     ap.add_argument("--submission", type=Path, default=Path("runs/submission.csv"))
-    ap.add_argument("--experts", type=int, default=256)
+    ap.add_argument("--experts", type=int, default=512)
+    ap.add_argument("--init-codebook", type=Path,
+                    default=Path("submission_train.csv"),
+                    help="angle vectors to seed the codebook with; 'none' for a cold start")
     ap.add_argument("--active", type=int, default=64, help="experts evaluated per step")
     ap.add_argument("--d-model", type=int, default=256)
     ap.add_argument("--gamma-box", type=float, default=1.6)
@@ -423,6 +467,13 @@ def main(argv=None):
 
     if args.train:
         model = AngleMoE(args.experts, args.d_model, gamma_box=args.gamma_box).to(dev)
+        if str(args.init_codebook).lower() != "none" and args.init_codebook.exists():
+            seeded = init_codebook(model, load_angle_file(args.init_codebook))
+            print(f"codebook seeded with {seeded} vectors from {args.init_codebook} "
+                  f"(gamma box widened to {model.gamma_box:.2f})")
+            with torch.no_grad():
+                base = expert_probs(sim, h_train, model.angles()).max(dim=1).values
+            print(f"best-of-codebook on h_train before any training: {base.mean():.5f}")
         opt = torch.optim.Adam(model.parameters(), lr=args.lr)
         train(sim, model, opt, args.iters, args.batch, args.active, dev,
               h_val=h_train, out_dir=args.out, seed=args.seed)
