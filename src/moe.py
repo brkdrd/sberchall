@@ -332,17 +332,43 @@ def _gate_topk(sim, model, h, k):
 
 
 def evaluate(sim, model, h, top_k=8, polish_steps=0, lr_gamma=0.05, lr_beta=0.03,
-             chunk=2048):
-    """Score the model on a set of instances. `polish_steps=0` measures the gate alone."""
+             chunk=2048, select="measured"):
+    """Score the model on a set of instances.
+
+    `select` decides how the `top_k` candidates to polish are chosen out of the codebook:
+
+    - **"measured"** — score every expert against `h` through the simulator and take the
+      best. The codebook is small and the scoring is forward-only, so this costs `M`
+      circuit evaluations per instance, against the thousands the polish costs. There is
+      no reason to trust a predicted ranking when the true one is this cheap, and it
+      cannot do worse than the gate by construction.
+    - **"gate"** — rank by the gate's logits alone, never consulting the simulator. This
+      is what an angle-*prediction* model does in the strict sense, and it is what the
+      reported `gate_P` measures, but it throws away a cheap exact signal.
+
+    `gate_P` is always the measured P of the gate's own top pick, so the two selection
+    modes stay comparable and the gate's contribution is visible either way.
+    """
     n = h.shape[0]
     with torch.no_grad():
         ang_all = model.angles()
-        idx = _gate_topk(sim, model, h, top_k)
-        gate1 = ang_all[idx[:, 0]]
-        p_gate = torch.cat([sim.p_ground(h[l:l + chunk], gate1[l:l + chunk, :DEPTH],
-                                         gate1[l:l + chunk, DEPTH:])
-                            for l in range(0, n, chunk)])
-    out = {"gate_P": p_gate.mean().item()}
+        logits = model.logits(canonical_features(sim, h))
+        if select == "measured":
+            table = expert_probs(sim, h, ang_all, chunk * 4)          # (N, M)
+            idx = table.topk(min(top_k, model.n_experts), dim=1).indices
+            rows = torch.arange(n, device=h.device)
+            p_gate = table[rows, logits.argmax(dim=1)]
+        elif select == "gate":
+            idx = logits.topk(min(top_k, model.n_experts), dim=1).indices
+            g1 = ang_all[idx[:, 0]]
+            p_gate = torch.cat([sim.p_ground(h[l:l + chunk], g1[l:l + chunk, :DEPTH],
+                                             g1[l:l + chunk, DEPTH:])
+                                for l in range(0, n, chunk)])
+        else:
+            raise ValueError(f"unknown select {select!r}")
+    out = {"gate_P": p_gate.mean().item(), "select": select}
+    if select == "measured":
+        out["best_of_codebook_P"] = table.max(dim=1).values.mean().item()
     if polish_steps > 0:
         cand = ang_all[idx.reshape(-1)].clone()
         hr = h.repeat_interleave(idx.shape[1], dim=0)
@@ -404,6 +430,26 @@ def init_codebook(model, ang, gamma_box=None):
     return m
 
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def resolve_seed(path):
+    """Find the seed file relative to the CWD or to the repo root.
+
+    Inside the container the working directory is not necessarily the repo, and a seed
+    that cannot be found must not be skipped quietly: the run that produced
+    models/moe_best.pt did exactly that and trained from cold to 0.1537, against the
+    0.3047 the seed alone scores.
+    """
+    p = Path(path)
+    for cand in (p, REPO_ROOT / p):
+        if cand.exists():
+            return cand
+    raise FileNotFoundError(
+        f"codebook seed {path} not found (looked in {p.resolve()} and {REPO_ROOT / p}). "
+        f"Pass --init-codebook none for a deliberate cold start.")
+
+
 def load_angle_file(path):
     """Angle vectors from a submission .csv, a plain .npy, or any (*, 10) array in an .npz."""
     path = Path(path)
@@ -454,6 +500,10 @@ def main(argv=None):
     ap.add_argument("--lr-gamma", type=float, default=0.05)
     ap.add_argument("--lr-beta", type=float, default=0.03)
     ap.add_argument("--chunk", type=int, default=2048)
+    ap.add_argument("--freeze-codebook", type=int, default=1,
+                    help="1: train the gate only, so a seeded codebook cannot regress")
+    ap.add_argument("--select", default="measured", choices=("measured", "gate"),
+                    help="how the candidates to polish are picked out of the codebook")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args(argv)
@@ -467,18 +517,34 @@ def main(argv=None):
 
     if args.train:
         model = AngleMoE(args.experts, args.d_model, gamma_box=args.gamma_box).to(dev)
-        if str(args.init_codebook).lower() != "none" and args.init_codebook.exists():
-            seeded = init_codebook(model, load_angle_file(args.init_codebook))
-            print(f"codebook seeded with {seeded} vectors from {args.init_codebook} "
+        floor = None
+        if str(args.init_codebook).lower() != "none":
+            seed_path = resolve_seed(args.init_codebook)
+            seeded = init_codebook(model, load_angle_file(seed_path))
+            print(f"codebook seeded with {seeded} vectors from {seed_path} "
                   f"(gamma box widened to {model.gamma_box:.2f})")
+            # on a subset: M x N circuit evaluations is seconds on a GPU but ten minutes
+            # on CPU, and this is a sanity print, not a reported result
             with torch.no_grad():
-                base = expert_probs(sim, h_train, model.angles()).max(dim=1).values
-            print(f"best-of-codebook on h_train before any training: {base.mean():.5f}")
-        opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+                sub = h_train[:128]
+                floor = expert_probs(sim, sub, model.angles()).max(dim=1).values.mean().item()
+            print(f"best-of-codebook on {sub.shape[0]} h_train instances before any "
+                  f"training: {floor:.5f}")
+        else:
+            print("cold start: no codebook seed")
+        if args.freeze_codebook and floor is not None:
+            model.codebook.requires_grad_(False)
+            print("codebook frozen: training fits the gate only, so best-of-codebook "
+                  "cannot regress below the floor above")
+        params = [p for p in model.parameters() if p.requires_grad]
+        opt = torch.optim.Adam(params, lr=args.lr)
         train(sim, model, opt, args.iters, args.batch, args.active, dev,
               h_val=h_train, out_dir=args.out, seed=args.seed)
         res = evaluate(sim, model, h_train, args.top_k, args.polish,
-                       args.lr_gamma, args.lr_beta, args.chunk)
+                       args.lr_gamma, args.lr_beta, args.chunk, args.select)
+        if floor is not None and "best_of_codebook_P" in res:
+            print(f"best-of-codebook after training: {res['best_of_codebook_P']:.5f} "
+                  f"(floor was {floor:.5f})")
         msg = f"h_train: gate alone {res['gate_P']:.5f}"
         if "polished_P" in res:
             msg += f", top-{args.top_k} polished {res['polished_P']:.5f}"
@@ -486,15 +552,27 @@ def main(argv=None):
 
     if args.predict is not None:
         ckpt = args.ckpt or (args.out / "best.pt")
-        model = load(ckpt, dev)
+        if str(ckpt).lower() == "none" or not Path(ckpt).exists():
+            # Fallback with no trained gate. With --select measured the gate plays no part
+            # in choosing candidates, so a seeded codebook alone still produces a valid
+            # submission -- worth having when a training run is unavailable or suspect.
+            model = AngleMoE(args.experts, args.d_model, gamma_box=args.gamma_box).to(dev)
+            seed_path = resolve_seed(args.init_codebook)
+            init_codebook(model, load_angle_file(seed_path))
+            print(f"no checkpoint at {ckpt}: predicting from a codebook seeded with "
+                  f"{seed_path} and an untrained gate (select={args.select})")
+        else:
+            model = load(ckpt, dev)
         h = torch.tensor(np.load(args.predict), dtype=torch.float32, device=dev)
         t0 = time.time()
         res = evaluate(sim, model, h, args.top_k, args.polish, args.lr_gamma,
-                       args.lr_beta, args.chunk)
+                       args.lr_beta, args.chunk, args.select)
         dt = time.time() - t0
         if "angles" not in res:
             raise SystemExit("--polish must be > 0 to produce a submission")
         write_submission(args.submission, res["angles"])
+        if "best_of_codebook_P" in res:
+            print(f"  best-of-codebook (measured, no polish): {res['best_of_codebook_P']:.5f}")
         print(f"{args.predict.name}: gate alone {res['gate_P']:.5f}, "
               f"polished {res['polished_P']:.5f}  [{dt:.0f}s for {h.shape[0]} instances, "
               f"limit 600 s]")

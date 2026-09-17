@@ -153,7 +153,7 @@ services:
   # the real training run; checkpoints and history land in ./runs/moe
   moe:
     <<: [*build, *gpu]
-    command: python -m src.moe --train --iters 4000 --out runs/moe
+    command: python -m src.moe --train --iters 1500 --out runs/moe
 
   # h_train, the same code path the submission uses -- this is the number to report
   moe-validate:
@@ -161,6 +161,14 @@ services:
     command: >
       python -m src.moe --predict data/raw/sberdata/h_train.npy --ckpt runs/moe/best.pt
       --submission runs/submission_train.csv
+
+  # Fallback needing no training at all: seed the codebook, select by measured P, polish.
+  # Guarantees a valid submission if a training run is unavailable or looks wrong.
+  moe-predict-seeded:
+    <<: [*build, *gpu]
+    command: >
+      python -m src.moe --predict data/raw/sberdata/h_test.npy --ckpt none
+      --submission runs/submission_seeded.csv
 
   # the deliverable: angles for h_test
   moe-predict:

@@ -46,6 +46,12 @@ COPY src/ src/
 # h_test.npy usable the day it lands, with no rebuild.
 COPY data/raw/ data/raw/
 
+# the codebook seed: 500 searched angle vectors, one per h_train instance. Without this in
+# the image src.moe cannot find its seed and (before the fix) trained from cold to half the
+# score the seed alone reaches.
+COPY submission_train.csv .
+COPY models/ models/
+
 # checkpoints, logs and submissions land here; mount it to keep them
 VOLUME /app/runs
 
