@@ -9,3 +9,9 @@ data/generated/
 *.npz
 *.csv
 !data/raw/*.npy
+
+# ...except the two files that ARE part of the image: the codebook seed src.moe trains
+# from, and the shipped checkpoint. Docker applies the last matching pattern, so these
+# negations re-include what the blanket rules above take out.
+!submission_train.csv
+!models/*.pt
