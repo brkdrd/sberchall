@@ -71,7 +71,82 @@ README – описание данных и инструкции по запус
 
 ---
 
-# Solution: the node-chain policy
+# Solution: a mixture of angle experts
+
+**Run it:** open `solution.ipynb` in Google Colab and `Runtime -> Run all`. It clones this
+repo, takes `J.npy`, `h_test.npy` and the organisers' unmodified `QAOA.py` from it, loads
+the trained checkpoint, and writes `submission.csv`. Nothing needs editing by hand, and the
+inference cell prints its own wall clock against the 600 s limit rather than asserting it
+fits.
+
+## Why a codebook and a gate
+
+Three measurements, not an architectural preference:
+
+- **It is not regression.** For a fixed `h` the good angle vectors form several disjoint
+  blobs, one per basin. An L2 fit to a set of search-generated labels lands on their mean,
+  which lies in no basin at all.
+- **It is not search.** 500 winning angle vectors cross-evaluated against all 500 instances
+  give mean P 0.315 with *no search at all*, against 0.312 for the 16k-start search that
+  produced them (`src/library.py`). Quadrupling the starts moved nothing.
+- **It is selection.** The good basins are shared between instances; what changes with `h`
+  is *which* one is right.
+
+So: a learned codebook `C` of M angle vectors, and a gate that scores them against `h`.
+Both are trained together, straight through the organisers' differentiable simulator, on
+
+    L(h) = -log  sum_m  softmax(gate(h))_m * P_ground(h, C_m)
+
+Maximising the mixture rather than the arg-max expert is what makes it trainable: every
+expert receives gradient in proportion to the responsibility the gate assigns it, so
+experts specialise while the gate partitions. It is the EM split, done by gradient descent
+through a quantum circuit. No angle labels are generated anywhere; training `h` is
+synthesised U(-1, 1) and the official `h_train` is validation only.
+
+## The features fold the symmetry group away exactly
+
+`P_ground` is invariant under a 128-element group: swapping the two qubits of any of the
+six pairs `(i, 11-i)` (since `v_i = v_{11-i}` makes `J` blind to it), and `h -> -h`. All 128
+leave the optimal angles unchanged, so feeding raw `h` asks the gate to learn 128 copies of
+one function. `moe.canonical_features` folds it away **bit-exactly** — 0.0 deviation over
+all 128 elements on both `h_train` and `h_test` — and three things had to be right for that:
+
+- the sign flip and the pair sort **do not commute** (negating `h` exchanges min and max
+  inside every pair), so the sign is fixed first;
+- the sign key is `sum_i h_i v_i`, not the mean-field magnetisation: the latter is discrete
+  and **exactly zero on 43 of the 500** `h_train` instances, which would leave those
+  un-canonicalised;
+- `sim.quad` is float32, so a configuration and its pair-swapped twin differ by ~1e-7. On
+  the instance whose gap is 6.3e-5 that is a 2e-3 *relative* error landing straight on
+  `log(gap)`, so the feature path rebuilds the energy table in float64.
+
+## Running it
+
+```bash
+docker compose run --rm moe-smoke-cpu    # ~1 min, proves the code and the mounts
+docker compose run --rm moe-smoke        # same on the GPU
+docker compose run --rm moe              # the real training run
+docker compose run --rm moe-validate     # the submission code path, scored on h_train
+docker compose run --rm moe-predict      # runs/submission.csv for h_test
+```
+
+Every hyperparameter is a flag: `python -m src.moe --help`.
+
+## What the p=5 ceiling actually is
+
+Worth stating plainly, because it is the result of about twenty GPU-hours. Six independent
+methods agree per instance, on instance 88 (spectral gap 0.025): Adam multistart 0.107, a
+wide `|gamma| <= 12` box 0.092, coordinate-wise **global** grid search 0.104, continuation
+in the coupling strength 0.107, energy-first then P 0.096, and tolerance annealing 0.104.
+Growing the depth with INTERP gives 0.10 / 0.21 / 0.26 / 0.34 at p = 5 / 8 / 10 / 14.
+
+The annealing run says it most clearly. Optimising `P(E <= Emin + tau)` and shrinking
+`tau`, the circuit reaches **0.977** at `tau = 4` and loses almost all of it by `tau = 0`.
+Depth 5 concentrates amplitude in the low-energy window perfectly well; what it cannot do
+is resolve the ground state from a competitor 0.025 below it. That is why mean P over 500
+instances sits near 0.32 and why the narrow-gap quartile does not move under 11x budget.
+
+# Previous solution: the node-chain policy
 
 A chain of **nodes**. A node is a point in angle space, and it owns its **surroundings**:
 `k` probes sampled in a ball around it, each evaluated and then run forward under Adam.
